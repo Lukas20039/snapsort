@@ -1,0 +1,33 @@
+# Maintainer: Lukas Grundtner <lukas.grundtner@gmail.com>
+pkgname=snapsort
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Fast photo/video culler: flip through a folder, keep/reject in rounds, move the keepers, rotate, censor, crop for Instagram"
+arch=('any')
+url="https://github.com/Lukas20039/snapsort"
+license=('MIT')
+depends=('python' 'pyside6' 'qt6-multimedia' 'qt6-multimedia-ffmpeg' 'qt6-imageformats' 'kimageformats'
+         'libjpeg-turbo' 'ffmpeg')
+makedepends=('python-build' 'python-installer' 'python-wheel' 'python-setuptools')
+checkdepends=('python-pytest')
+optdepends=('libheif: HEIC/HEIF photos'
+            'kio-fuse: open webdavs://, smb://, sftp:// folders')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cd "$pkgname-$pkgver"
+  python -m build --wheel --no-isolation
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  QT_QPA_PLATFORM=offscreen python -m pytest -q
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  python -m installer --destdir="$pkgdir" dist/*.whl
+  install -Dm644 snapsort.desktop "$pkgdir/usr/share/applications/snapsort.desktop"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

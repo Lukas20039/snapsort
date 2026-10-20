@@ -5,19 +5,25 @@ move the keepers into a subfolder. Rotate/flip, censor, pen, text, box, arrow.
 
 ## Install (Arch)
 
+From the AUR (once published): `yay -S snapsort`
+
+From source:
+
 ```bash
-sudo pacman -S --needed pyside6 libheif qt6-multimedia-ffmpeg qt6-imageformats kimageformats libjpeg-turbo ffmpeg python-pipx
-pipx install --system-site-packages --python /usr/bin/python3 -e ~/dev/snapsort
+sudo pacman -S --needed pyside6 qt6-multimedia-ffmpeg qt6-imageformats kimageformats libheif libjpeg-turbo ffmpeg python-pipx
+git clone https://github.com/Lukas20039/snapsort && cd snapsort
+pipx install --system-site-packages --python /usr/bin/python3 -e .
 # Plasma's PATH has no ~/.local/bin, so the menu entry needs the absolute path
-sed "s|^Exec=snapsort|Exec=$HOME/.local/bin/snapsort|" ~/dev/snapsort/snapsort.desktop > ~/.local/share/applications/snapsort.desktop
-update-desktop-database ~/.local/share/applications && kbuildsycoca6
+sed "s|^Exec=snapsort|Exec=$HOME/.local/bin/snapsort|" snapsort.desktop > ~/.local/share/applications/snapsort.desktop
+update-desktop-database ~/.local/share/applications
 ```
 
-Right-click an image in Dolphin → *Open With → snapsort* opens its folder at that image.
-Network folders work too, via kio-fuse: `snapsort webdavs://host/path/` or Open With on a
-WebDAV/SMB/SFTP file in Dolphin.
+PySide6 must come from pacman, not pip: only the system Qt sees the kimageformats plugins (HEIC/AVIF).
 
-Run: `snapsort [folder-or-file]`
+Run: `snapsort [folder | file | webdavs://… | smb://…]`
+
+Right-click an image in Dolphin → *Open With → snapsort* opens its folder at that image.
+Network folders work via kio-fuse (KDE).
 
 ## Culling 50 photos down to 10
 
