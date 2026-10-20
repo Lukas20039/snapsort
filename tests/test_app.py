@@ -5,7 +5,7 @@ import pytest
 from PySide6.QtCore import QFile, QPointF, QSettings, Qt
 from PySide6.QtGui import QColor, QImage
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QMessageBox, QToolButton
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from snapsort import app as app_mod
 from snapsort import imaging
@@ -69,16 +69,30 @@ def test_keep_then_reject_is_exclusive(win):
     assert win.store.tags("a1.png") == {"reject"}
 
 
-def test_slot_tag_and_filter_cycle(win):
-    key(win, Qt.Key.Key_1)
-    assert win.store.tags("a1.png") == {"tag1"}
+def test_segments_filter_by_decision(win):
+    key(win, Qt.Key.Key_K)  # a1 kept, selection moves on
     ctrl = Qt.KeyboardModifier.ControlModifier
-    key(win, Qt.Key.Key_1, ctrl)
-    assert win.view == ["a1.png"]
+    key(win, Qt.Key.Key_2, ctrl)
+    assert win.view == ["a1.png"] and win.act["seg_keep"].isChecked()
     key(win, Qt.Key.Key_1, ctrl)
     assert win.view == NAMES[1:]
-    key(win, Qt.Key.Key_1, ctrl)
+    key(win, Qt.Key.Key_0, ctrl)
     assert win.view == NAMES
+    assert win.act["seg_keep"].iconText() == "Behalten 1" and win.act["seg_open"].iconText() == "Offen 4"
+
+
+def test_every_command_has_a_button_or_menu_entry(win):
+    keyboard_only = {"toggle", "first", "last"} | {f"seg_{s}" for s in ("all", "open", "keep", "reject", "fav")}
+    missing = [aid for aid, a in win.act.items()
+               if aid not in keyboard_only and not any(o is not win for o in a.associatedObjects())]
+    assert missing == []
+
+
+def test_toolbar_button_rotates(win):
+    p = win.folder / "a1.png"
+    before = p.read_bytes()
+    QTest.mouseClick(win.top.widgetForAction(win.act["rot_r"]), Qt.MouseButton.LeftButton)
+    assert p.read_bytes() != before
 
 
 class FirstButtonBox:
@@ -90,6 +104,7 @@ class FirstButtonBox:
 
     def setWindowTitle(self, _): pass
     def setText(self, _): pass
+    def setDefaultButton(self, _): pass
     def exec(self): pass
 
     def addButton(self, *_):
@@ -104,7 +119,7 @@ def test_next_round_and_undo(win, monkeypatch):
     monkeypatch.setattr(app_mod, "QMessageBox", FirstButtonBox)
     win.store.set_verdict("a1.png", "keep")
     win.store.set_verdict("a3.png", "reject")
-    key(win, Qt.Key.Key_N)  # first button: undecided -> keep
+    key(win, Qt.Key.Key_N)  # first button: take the open ones along
     assert {n: win.store.survived(n) for n in NAMES} == {
         "a1.png": 1, "a2.png": 1, "a3.png": 0, "a4.png": 1, "b.jpg": 1}
     assert win.filter.min_round == 1 and "a3.png" not in win.view
@@ -113,12 +128,29 @@ def test_next_round_and_undo(win, monkeypatch):
     assert win.store.tags("a1.png") == {"keep"} and win.store.tags("a3.png") == {"reject"}
 
 
+def test_next_round_uses_whole_round_not_segment(win, monkeypatch):
+    monkeypatch.setattr(app_mod, "QMessageBox", FirstButtonBox)
+    win.store.set_verdict("a1.png", "keep")
+    win.store.set_verdict("a2.png", "reject")
+    win.set_segment("keep")
+    key(win, Qt.Key.Key_N)
+    assert win.store.survived("a3.png") == 1 and win.store.survived("a2.png") == 0
+
+
+def test_earlier_round_is_read_only(win, monkeypatch):
+    monkeypatch.setattr(app_mod, "QMessageBox", FirstButtonBox)
+    win.store.set_verdict("a1.png", "keep")
+    key(win, Qt.Key.Key_N)
+    win.round_combo.setCurrentIndex(0)
+    assert win.sel_round == 0 and not win.act["keep"].isEnabled() and not win.act["next_round"].isEnabled()
+
+
 def test_move_view_and_undo(win, monkeypatch):
-    monkeypatch.setattr(app_mod.QInputDialog, "getText", staticmethod(lambda *a, **k: ("best", True)))
+    monkeypatch.setattr(app_mod.MoveDialog, "exec", lambda self: (self.combo.setEditText("best"), 1)[1])
     folder = win.folder
     for n in ("a1.png", "a2.png"):
         win.store.toggle(n, "fav")
-    win.cycle_filter("fav")
+    win.set_segment("fav")
     key(win, Qt.Key.Key_M)
     best = folder / "best"
     assert sorted(p.name for p in best.iterdir()) == [".snapsort.json", "a1.png", "a2.png"]
@@ -179,8 +211,8 @@ def test_edit_save_targets_edited_file_after_filter_change(win):
     others = {n: (win.folder / n).read_bytes() for n in NAMES if n != "a1.png"}
     key(win, Qt.Key.Key_Return)
     key(win, Qt.Key.Key_E)
-    assert not win.filterbar.isEnabled()
-    win.cycle_filter("fav")  # a1 drops out of the view while editing
+    assert not win.sichten.isVisible() and not win.act["keep"].isEnabled()
+    win.set_segment("fav")  # a1 drops out of the view while editing
     win.editor.tool = "pixelate"
     win.editor.commit(QPointF(0, 0), QPointF(48, 32), None)
     QTest.keyClick(win.editor.canvas, Qt.Key.Key_S, Qt.KeyboardModifier.ControlModifier)
@@ -193,13 +225,3 @@ def test_undo_refuses_to_overwrite_changed_file(win):
     p.write_bytes(b"changed by someone else")
     key(win, Qt.Key.Key_Z, Qt.KeyboardModifier.ControlModifier)
     assert p.read_bytes() == b"changed by someone else"
-
-
-def test_filterbar_does_not_leak_widgets(win):
-    QApplication.processEvents()
-    for _ in range(30):
-        win.toggle_tag("tag1")
-        win.toggle_tag("x" if _ % 2 else "y")
-        QApplication.processEvents()
-        QApplication.sendPostedEvents(None, 52)  # DeferredDelete
-    assert len(win.filterbar.findChildren(QToolButton)) < 40

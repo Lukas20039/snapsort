@@ -232,6 +232,8 @@ class Loader(QObject):
             if img.size() == full or img.size() == full.transposed():
                 img.setText("full", "1")
             self._decoded.emit(path, img, gen)
+        except RuntimeError:
+            pass  # loader deleted while the app quits
         except Exception as e:  # noqa: BLE001 - reported to UI
             self._decode_failed.emit(path, str(e), gen)
 
@@ -277,6 +279,8 @@ class Loader(QObject):
     def _thumb(self, path, gen):
         try:
             self._thumbed.emit(path, make_thumb(path), gen)
+        except RuntimeError:
+            pass  # loader deleted while the app quits
         except Exception:  # noqa: BLE001
             self._thumb_failed.emit(path, gen)
 

@@ -1,18 +1,35 @@
-"""Edit mode: pen, box, arrow, text, pixelate and blur on the full-resolution image."""
+"""Edit mode: censor (pixelate, blur, black out), pen, box, arrow, text on the full-resolution image."""
 import math
 
-from PySide6.QtCore import QLineF, QPointF, QRect, QRectF, Qt, Signal
-from PySide6.QtGui import (QAction, QActionGroup, QColor, QFont, QImage, QKeySequence, QPainter, QPainterPath,
+from PySide6.QtCore import QPointF, QRect, QRectF, QSize, Qt, Signal
+from PySide6.QtGui import (QAction, QActionGroup, QColor, QFont, QIcon, QImage, QKeySequence, QPainter, QPainterPath,
                            QPen, QPixmap, QTransform)
-from PySide6.QtWidgets import QColorDialog, QInputDialog, QSpinBox, QToolBar, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (QColorDialog, QInputDialog, QSizePolicy, QSpinBox, QToolBar, QVBoxLayout,
+                               QWidget)
 
-TOOLS = [("pen", "P", "Pen"), ("box", "B", "Box"), ("arrow", "A", "Arrow"), ("text", "T", "Text"),
-         ("pixelate", "C", "Censor (pixelate)"), ("blur", "U", "Blur")]
+from .views import theme_icon
+
+# key, shortcut, label, icons, text fallback, hint on the canvas
+TOOLS = [
+    ("pixelate", "C", "Zensieren", ("pixelate",), "▦ Zensieren",
+     "Rechteck über Kennzeichen oder Gesicht ziehen"),
+    ("black", "S", "Schwärzen", ("color-fill", "fill-color"), "■ Schwärzen",
+     "Rechteck ziehen – wird komplett schwarz"),
+    ("blur", "U", "Weichzeichnen", ("blur", "blurfx"), "◌ Weichzeichnen",
+     "Rechteck ziehen – nur weich, für Kennzeichen besser Zensieren oder Schwärzen"),
+    None,
+    ("pen", "P", "Stift", ("draw-freehand",), "✎ Stift", "Mit gedrückter Maustaste zeichnen"),
+    ("box", "B", "Rahmen", ("draw-rectangle",), "▭ Rahmen", "Rechteck ziehen"),
+    ("arrow", "A", "Pfeil", ("draw-arrow", "draw-arrow-forward"), "➚ Pfeil", "Von Start zu Ziel ziehen"),
+    ("text", "T", "Text", ("draw-text",), "T Text", "Klicken, wo der Text stehen soll"),
+]
+HINTS = {t[0]: t[5] for t in TOOLS if t}
+REGION_TOOLS = ("pixelate", "black", "blur")
 
 
 def pixelate(img: QImage, r: QRect) -> QImage:
     sub = img.copy(r)
-    b = max(8, min(r.width(), r.height()) // 10)
+    b = max(8, min(r.width(), r.height()) // 4)  # at most ~4 blocks across the short side
     small = sub.scaled(max(1, r.width() // b), max(1, r.height() // b),
                        Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.FastTransformation)
     return small.scaled(r.size(), Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.FastTransformation)
@@ -20,8 +37,9 @@ def pixelate(img: QImage, r: QRect) -> QImage:
 
 def blur(img: QImage, r: QRect) -> QImage:
     sub = img.copy(r)
+    s = max(4, min(r.width(), r.height()) // 4)  # ~4 samples across the short side
     for _ in range(2):
-        small = sub.scaled(max(1, r.width() // 16), max(1, r.height() // 16),
+        small = sub.scaled(max(1, r.width() // s), max(1, r.height() // s),
                            Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
         sub = small.scaled(r.size(), Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
     return sub
@@ -99,9 +117,10 @@ class _Canvas(QWidget):
         p.fillRect(self.rect(), QColor(16, 16, 16))
         if self.view:
             p.drawPixmap(self.xf.map(QPointF(0, 0)), self.view)
-        p.setTransform(self.xf)
         if self.start is None:
+            self._hint(p)
             return
+        p.setTransform(self.xf)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setPen(self.ed.pen())
         t = self.ed.tool
@@ -110,9 +129,25 @@ class _Canvas(QWidget):
         elif t == "arrow":
             p.drawPath(arrow_path(self.start, self.cur, self.ed.width.value()))
         else:
-            if t in ("pixelate", "blur"):
+            if t in REGION_TOOLS:
                 p.setPen(QPen(QColor(255, 255, 255), 0, Qt.PenStyle.DashLine))
             p.drawRect(QRectF(self.start, self.cur).normalized())
+
+
+    def _hint(self, p: QPainter):
+        f = QFont(self.font())
+        f.setPointSize(11)
+        p.setFont(f)
+        text = HINTS[self.ed.tool]
+        w = p.fontMetrics().horizontalAdvance(text) + 28
+        r = QRectF((self.width() - w) / 2, 14, w, p.fontMetrics().height() + 14)
+        p.setOpacity(0.5 if self.ed.dirty else 1.0)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(0, 0, 0, 170))
+        p.drawRoundedRect(r, 8, 8)
+        p.setPen(QColor("white"))
+        p.drawText(r, Qt.AlignmentFlag.AlignCenter, text)
 
 
 class EditView(QWidget):
@@ -126,36 +161,76 @@ class EditView(QWidget):
         self.tool = "pixelate"
         self.color = QColor("#ff2020")
         bar = QToolBar()
+        bar.setIconSize(QSize(28, 28))
         group = QActionGroup(self)
-        for key, sc, label in TOOLS:
-            a = QAction(f"{label} ({sc})", self, checkable=True, shortcut=QKeySequence(sc))
-            a.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        for t in TOOLS:
+            if t is None:
+                bar.addSeparator()
+                continue
+            key, sc, label, icons, fallback, _ = t
+            a = self._action(label, sc, icons, fallback, lambda _=False, k=key: self.set_tool(k), checkable=True)
             a.setChecked(key == self.tool)
-            a.triggered.connect(lambda _=False, k=key: setattr(self, "tool", k))
             group.addAction(a)
             bar.addAction(a)
-            self.addAction(a)
+            bar.widgetForAction(a).setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         bar.addSeparator()
-        self.color_act = bar.addAction("Color", self.pick_color)
+        self.color_act = QAction("Farbe", self, triggered=self.pick_color)
         self.width = QSpinBox(minimum=1, maximum=500, value=max(3, self.image.width() // 300))
-        self.width.setPrefix("width ")
-        bar.addWidget(self.width)
+        self.width.setPrefix("Stärke ")
+        self.width.setSuffix(" px")
+        self.width.setToolTip("Strichstärke ([ und ])")
+        bar.addAction(self.color_act)
+        self.style_acts = [self.color_act, bar.addWidget(self.width)]
+        for sc, d in (("[", -1), ("]", 1)):
+            self._action(sc, sc, (), sc, lambda _=False, d=d: self._nudge(d))
         bar.addSeparator()
-        for label, sc, fn in [("Undo", "Ctrl+Z", self.undo_step), ("Save (overwrite)", "Ctrl+S", self.save_requested.emit),
-                              ("Cancel", "Esc", self.close_requested.emit), (None, "[", lambda: self._nudge(-1)),
-                              (None, "]", lambda: self._nudge(1))]:
-            a = QAction(f"{label} ({sc})" if label else sc, self, shortcut=QKeySequence(sc))
-            a.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
-            a.triggered.connect(fn)
-            self.addAction(a)
-            if label:
-                bar.addAction(a)
+        self.undo_act = self._action("Rückgängig", "Ctrl+Z", ("edit-undo",), "↶", self.undo_step)
+        bar.addAction(self.undo_act)
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        bar.addWidget(spacer)
+        cancel = self._action("Abbrechen", "Esc", ("dialog-cancel",), "✗", self.close_requested.emit)
+        self.save_act = self._action("Speichern (überschreibt Original)", "Ctrl+S", ("document-save",), "💾",
+                                     self.save_requested.emit)
+        self.save_act.setToolTip("Überschreibt die Originaldatei. Bis zum Beenden mit Strg+Z rückgängig zu machen.")
+        for a in (cancel, self.save_act):
+            bar.addAction(a)
+            bar.widgetForAction(a).setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        f = bar.widgetForAction(self.save_act).font()
+        f.setBold(True)
+        bar.widgetForAction(self.save_act).setFont(f)
+        self.bar = bar
         self._update_color_icon()
         self.canvas = _Canvas(self)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(bar)
         lay.addWidget(self.canvas, 1)
+        self.set_tool(self.tool)
+        self._sync()
+
+    def _action(self, label, sc, icons, fallback, fn, checkable=False) -> QAction:
+        a = QAction(label, self, checkable=checkable, shortcut=QKeySequence(sc))
+        a.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        icon = theme_icon(*icons)
+        a.setIcon(icon)
+        if icon.isNull():
+            a.setIconText(fallback)
+        a.setToolTip(f"{label} ({QKeySequence(sc).toString(QKeySequence.SequenceFormat.NativeText)})")
+        a.triggered.connect(fn)
+        self.addAction(a)
+        return a
+
+    def set_tool(self, key):
+        self.tool = key
+        for a in self.style_acts:
+            a.setVisible(key not in REGION_TOOLS)
+        if hasattr(self, "canvas"):
+            self.canvas.update()
+
+    def _sync(self):
+        self.undo_act.setEnabled(self.dirty)
+        self.save_act.setEnabled(self.dirty)
 
     @property
     def dirty(self):
@@ -175,7 +250,10 @@ class EditView(QWidget):
             self._update_color_icon()
 
     def _update_color_icon(self):
-        self.color_act.setText(f"Color ■ {self.color.name()}")
+        pm = QPixmap(16, 16)
+        pm.fill(self.color)
+        self.color_act.setIcon(QIcon(pm))
+        self.color_act.setToolTip(f"Farbe wählen ({self.color.name()})")
 
     def _push(self, rect: QRectF) -> QRect:
         r = rect.toAlignedRect().intersected(self.image.rect())
@@ -185,17 +263,20 @@ class EditView(QWidget):
     def commit(self, a: QPointF, b: QPointF, path: QPainterPath):
         w = self.width.value()
         t = self.tool
-        if t in ("pixelate", "blur", "box"):
+        if t in (*REGION_TOOLS, "box"):
             rect = QRectF(a, b).normalized()
             if rect.width() < 2 or rect.height() < 2:
                 return
-        if t in ("pixelate", "blur"):
+        if t in REGION_TOOLS:
             r = self._push(rect)
             if r.isEmpty():
                 self.undo.pop()
                 return
             p = QPainter(self.image)
-            p.drawImage(r.topLeft(), (pixelate if t == "pixelate" else blur)(self.image, r))
+            if t == "black":
+                p.fillRect(r, QColor("black"))
+            else:
+                p.drawImage(r.topLeft(), (pixelate if t == "pixelate" else blur)(self.image, r))
         else:
             shape = path if t == "pen" else arrow_path(a, b, w) if t == "arrow" else None
             bounds = shape.boundingRect() if shape else rect
@@ -206,9 +287,10 @@ class EditView(QWidget):
             p.drawPath(shape) if shape else p.drawRect(rect)
         p.end()
         self.canvas.refresh()
+        self._sync()
 
     def add_text(self, pos: QPointF):
-        text, ok = QInputDialog.getText(self, "Text", "Text:")
+        text, ok = QInputDialog.getText(self, "Text einfügen", "Text:")
         if not ok or not text:
             return
         f = QFont()
@@ -226,6 +308,7 @@ class EditView(QWidget):
         p.drawText(pos, text)
         p.end()
         self.canvas.refresh()
+        self._sync()
 
     def undo_step(self):
         if not self.undo:
@@ -236,3 +319,4 @@ class EditView(QWidget):
         p.drawImage(r.topLeft(), patch)
         p.end()
         self.canvas.refresh()
+        self._sync()

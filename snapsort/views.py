@@ -1,23 +1,41 @@
 """Single-image/video view, thumbnail grid and help overlay."""
-import zlib
+import time
 
-from PySide6.QtCore import QAbstractListModel, QModelIndex, QRect, QSize, Qt, QUrl, Signal
-from PySide6.QtGui import QColor, QFont, QImage, QImageReader, QMovie, QPainter, QPixmap
+from PySide6.QtCore import QAbstractListModel, QModelIndex, QRect, QRectF, QSize, Qt, QUrl, Signal
+from PySide6.QtGui import QColor, QFont, QIcon, QImage, QImageReader, QMovie, QPainter, QPen, QPixmap
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import QLabel, QListView, QStackedWidget, QStyle, QStyledItemDelegate, QWidget
 
-from .store import VERDICTS, is_video
+from .store import is_video
 
-SLOT_COLORS = ["#e6194b", "#3cb44b", "#ffe119", "#4363d8", "#f58231",
-               "#911eb4", "#42d4f4", "#f032e6", "#bfef45"]
 CELL = QSize(196, 216)
+KEEP_COLOR, REJECT_COLOR, FAV_COLOR = QColor("#2e7d32"), QColor("#c62828"), QColor("#f9a825")
 
 
-def tag_color(tag, slots) -> QColor:
-    if tag in slots:
-        return QColor(SLOT_COLORS[slots.index(tag)])
-    return QColor.fromHsv(zlib.crc32(tag.encode()) % 360, 160, 220)
+def theme_icon(*names) -> QIcon:
+    for n in names:
+        i = QIcon.fromTheme(n)
+        if not i.isNull():
+            return i
+    return QIcon()
+
+
+def draw_badge(p: QPainter, right: int, top: int, text: str, bg: QColor) -> int:
+    """Rounded label ending at x=right; returns its left edge."""
+    f = QFont(p.font())
+    f.setBold(True)
+    f.setPointSize(12)
+    p.setFont(f)
+    w = p.fontMetrics().horizontalAdvance(text) + 20
+    h = p.fontMetrics().height() + 12
+    r = QRectF(right - w, top, w, h)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(bg)
+    p.drawRoundedRect(r, 6, 6)
+    p.setPen(QColor("white"))
+    p.drawText(r, Qt.AlignmentFlag.AlignCenter, text)
+    return int(r.left())
 
 
 class ImageCanvas(QWidget):
@@ -26,12 +44,19 @@ class ImageCanvas(QWidget):
     def __init__(self):
         super().__init__()
         self.pix: QPixmap | None = None
+        self.placeholder = False
         self.text = ""
+        self.tags: set = set()
         self.setMinimumSize(200, 150)
 
-    def show_image(self, img: QImage | None, text=""):
+    def show_image(self, img: QImage | None, text="", placeholder=False):
         self.pix = QPixmap.fromImage(img) if img is not None and not img.isNull() else None
+        self.placeholder = placeholder
         self.text = text
+        self.update()
+
+    def set_tags(self, tags):
+        self.tags = tags
         self.update()
 
     def target_size(self) -> QSize:
@@ -45,9 +70,8 @@ class ImageCanvas(QWidget):
         p.fillRect(self.rect(), QColor(16, 16, 16))
         if self.pix:
             p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-            dpr = self.devicePixelRatioF()
-            size = self.pix.size() / dpr
-            if size.width() > self.width() or size.height() > self.height():
+            size = self.pix.size() / self.devicePixelRatioF()
+            if self.placeholder or size.width() > self.width() or size.height() > self.height():
                 size = size.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio)
             r = QRect((self.width() - size.width()) // 2, (self.height() - size.height()) // 2,
                       size.width(), size.height())
@@ -55,9 +79,20 @@ class ImageCanvas(QWidget):
         if self.text:
             p.setPen(QColor(220, 220, 220))
             p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self.text)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        x = self.width() - 12
+        if "keep" in self.tags:
+            x = draw_badge(p, x, 12, "✓ Behalten", KEEP_COLOR) - 8
+        elif "reject" in self.tags:
+            x = draw_badge(p, x, 12, "✗ Verworfen", REJECT_COLOR) - 8
+        if "fav" in self.tags:
+            draw_badge(p, x, 12, "★", FAV_COLOR)
 
 
 class SingleView(QStackedWidget):
+    navigate = Signal(int)
+    back = Signal()
+
     def __init__(self):
         super().__init__()
         self.canvas = ImageCanvas()
@@ -71,6 +106,18 @@ class SingleView(QStackedWidget):
         self.player.setAudioOutput(self.audio)
         self.player.setVideoOutput(self.video)
         self.movie: QMovie | None = None
+        self.last_wheel = 0.0
+
+    def wheelEvent(self, e):
+        now = time.monotonic()
+        dy = e.angleDelta().y()
+        if dy and now - self.last_wheel > 0.15:
+            self.last_wheel = now
+            self.navigate.emit(-1 if dy > 0 else 1)
+        e.accept()
+
+    def mouseDoubleClickEvent(self, e):
+        self.back.emit()
 
     def stop(self):
         self.player.stop()
@@ -100,6 +147,9 @@ class SingleView(QStackedWidget):
             return "anim"
         self.setCurrentWidget(self.canvas)
         return "image"
+
+    def kind(self) -> str:
+        return {self.video: "video", self.anim: "anim"}.get(self.currentWidget(), "image")
 
     def toggle_play(self):
         if self.movie:
@@ -136,7 +186,7 @@ class GridModel(QAbstractListModel):
         if role == Qt.ItemDataRole.DecorationRole:
             return self.win.loader.thumb(self.win.path(name))
         if role == Qt.ItemDataRole.UserRole:
-            return self.win.store.tags(name), self.win.store.survived(name)
+            return self.win.store.tags(name)
         return None
 
     def _ready(self, path, *_):
@@ -150,59 +200,47 @@ class GridModel(QAbstractListModel):
 
 
 class GridDelegate(QStyledItemDelegate):
-    def __init__(self, win):
-        super().__init__()
-        self.win = win
-
     def sizeHint(self, option, index):
         return CELL
 
     def paint(self, p: QPainter, opt, index):
-        r = opt.rect.adjusted(4, 4, -4, -4)
+        r = opt.rect.adjusted(5, 5, -5, -5)
         p.save()
-        if opt.state & QStyle.StateFlag.State_Selected:
-            p.fillRect(opt.rect, opt.palette.highlight())
         img_r = QRect(r.x(), r.y(), r.width(), r.height() - 20)
         img = index.data(Qt.ItemDataRole.DecorationRole)
         name = index.data()
+        tags = index.data(Qt.ItemDataRole.UserRole)
         if img is not None and not img.isNull():
             s = img.size().scaled(img_r.size(), Qt.AspectRatioMode.KeepAspectRatio)
-            p.drawImage(QRect(img_r.x() + (img_r.width() - s.width()) // 2,
-                              img_r.y() + (img_r.height() - s.height()) // 2, s.width(), s.height()), img)
+            img_r = QRect(img_r.x() + (img_r.width() - s.width()) // 2,
+                          img_r.y() + (img_r.height() - s.height()) // 2, s.width(), s.height())
+            p.drawImage(img_r, img)
         else:
-            p.fillRect(img_r, QColor(40, 40, 40))
-        tags, survived = index.data(Qt.ItemDataRole.UserRole)
-        f = QFont(p.font())
-        f.setBold(True)
-        f.setPointSize(14)
-        p.setFont(f)
-        if "fav" in tags:
-            p.setPen(QColor("#ffd700"))
-            p.drawText(img_r.adjusted(4, 2, 0, 0), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, "★")
-        if "keep" in tags or "reject" in tags:
-            keep = "keep" in tags
-            p.setPen(QColor("#2ecc40" if keep else "#ff4136"))
-            p.drawText(img_r.adjusted(0, 2, -4, 0), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop,
-                       "✓" if keep else "✗")
+            p.fillRect(img_r, QColor(60, 60, 60, 120))
+        if "reject" in tags:
+            p.fillRect(img_r, QColor(0, 0, 0, 140))
         if is_video(name):
-            p.setPen(QColor(255, 255, 255, 200))
+            f = QFont(p.font())
+            f.setPointSize(22)
+            p.setFont(f)
+            p.setPen(QColor(255, 255, 255, 220))
             p.drawText(img_r, Qt.AlignmentFlag.AlignCenter, "▶")
-        f.setPointSize(8)
-        p.setFont(f)
-        if survived:
-            p.setPen(QColor("#7fdbff"))
-            p.drawText(img_r.adjusted(4, 0, 0, -2), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignBottom,
-                       f"R{survived}")
-        x = img_r.right() - 12
-        p.setPen(Qt.PenStyle.NoPen)
-        for t in sorted(tags - {"fav", *VERDICTS}):
-            p.setBrush(tag_color(t, self.win.slots))
-            p.drawEllipse(x, img_r.bottom() - 12, 10, 10)
-            x -= 13
-        p.setPen(opt.palette.text().color())
-        f.setBold(False)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        x = img_r.right() - 4
+        if "keep" in tags:
+            x = draw_badge(p, x, img_r.top() + 4, "✓", KEEP_COLOR) - 4
+        elif "reject" in tags:
+            x = draw_badge(p, x, img_r.top() + 4, "✗", REJECT_COLOR) - 4
+        if "fav" in tags:
+            draw_badge(p, x, img_r.top() + 4, "★", FAV_COLOR)
+        if opt.state & QStyle.StateFlag.State_Selected:
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(opt.palette.highlight().color(), 3))
+            p.drawRoundedRect(QRectF(opt.rect).adjusted(2, 2, -2, -2), 4, 4)
+        f = QFont(opt.font)
         f.setPointSize(9)
         p.setFont(f)
+        p.setPen(opt.palette.text().color())
         label = p.fontMetrics().elidedText(name, Qt.TextElideMode.ElideMiddle, r.width())
         p.drawText(QRect(r.x(), r.bottom() - 16, r.width(), 16), Qt.AlignmentFlag.AlignCenter, label)
         p.restore()
@@ -216,22 +254,37 @@ class GridView(QListView):
         self.setMovement(QListView.Movement.Static)
         self.setUniformItemSizes(True)
         self.setGridSize(CELL)
+        self.setSpacing(0)
         self.setSelectionMode(QListView.SelectionMode.SingleSelection)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.setModel(model)
         self.setItemDelegate(delegate)
+        self.empty = QLabel(self.viewport(), alignment=Qt.AlignmentFlag.AlignCenter, wordWrap=True)
+        self.empty.hide()
+
+    def show_empty(self, text):
+        self.empty.setText(text)
+        self.empty.setVisible(bool(text))
+        self.empty.setGeometry(self.viewport().rect())
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self.empty.setGeometry(self.viewport().rect())
 
     def keyboardSearch(self, text):
         pass  # letters are app shortcuts, not type-ahead
 
 
 class HelpOverlay(QLabel):
-    def __init__(self, parent, rows):
+    def __init__(self, parent):
         super().__init__(parent)
-        html = "".join(f"<tr><td style='padding-right:18px'><b>{k}</b></td><td>{d}</td></tr>" for k, d in rows)
-        self.setText(f"<h3>snapsort keys</h3><table>{html}</table><p>Esc / ? closes</p>")
         self.setStyleSheet("background:rgba(0,0,0,215); color:#eee; padding:24px; font-size:13px")
         self.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         self.hide()
+
+    def set_rows(self, rows):
+        html = "".join(f"<tr><td style='padding-right:18px'><b>{k}</b></td><td>{d}</td></tr>" for k, d in rows)
+        self.setText(f"<h3>Tastenkürzel</h3><table>{html}</table><p>Esc oder ? schließt</p>")
 
     def toggle(self):
         self.setVisible(not self.isVisible())

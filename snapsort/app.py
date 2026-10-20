@@ -1,52 +1,74 @@
-"""Main window: keymap, modes, tagging, filters, rounds, move, undo."""
+"""Main window: one QAction per command (shared by keys, buttons, menus), culling rounds, move, undo."""
 import os
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QFile, QSettings, Qt, QTimer, QUrl
+from PySide6.QtCore import QFile, QSettings, QSize, Qt, QTimer, QUrl
 from PySide6.QtDBus import QDBusInterface, QDBusMessage
-from PySide6.QtGui import QAction, QGuiApplication, QKeySequence
-from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
-                               QHBoxLayout,
-                               QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox, QSpinBox, QStackedWidget,
-                               QToolBar, QToolButton, QWidget)
+from PySide6.QtGui import QAction, QActionGroup, QDesktopServices, QGuiApplication, QIcon, QKeySequence, QPixmap
+from PySide6.QtWidgets import (QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout, QLabel,
+                               QListView, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressBar,
+                               QSizePolicy, QStackedWidget, QToolBar, QToolButton, QVBoxLayout, QWidget)
 
 from . import imaging
 from . import store as st
 from .editor import EditView
 from .store import Filter, TagStore
-from .views import GridDelegate, GridModel, GridView, HelpOverlay, SingleView, tag_color
+from .views import GridDelegate, GridModel, GridView, HelpOverlay, SingleView, theme_icon
 
-S, G = "single", "grid"
-BROWSE = (S, G)
+S, G, E = "single", "grid", "edit"
 UNDO_LIMIT = 20
+# id, label, include, exclude
+SEGMENTS = [("all", "Alle", (), ()), ("open", "Offen", (), ("keep", "reject")), ("keep", "Behalten", ("keep",), ()),
+            ("reject", "Verworfen", ("reject",), ()), ("fav", "★ Favoriten", ("fav",), ())]
+
+
+def keys_text(keys) -> str:
+    return " / ".join(QKeySequence(k).toString(QKeySequence.SequenceFormat.NativeText) or k for k in keys)
+
+
+def spacer() -> QWidget:
+    w = QWidget()
+    w.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+    return w
+
+
+def kind_of(name) -> str:
+    if st.is_video(name):
+        return "video"
+    return "gif" if name.lower().endswith(".gif") else "image"
 
 
 class MainWindow(QMainWindow):
     def __init__(self, target=None):
         super().__init__()
         self.settings = QSettings("snapsort", "snapsort")
-        self.slots = list(self.settings.value("slots", [f"tag{i}" for i in range(1, 10)]))[:9]
-        self.slots += [f"tag{i}" for i in range(len(self.slots) + 1, 10)]
         self.loader = imaging.Loader(self)
         self.folder: Path | None = None
         self.names: list[str] = []
         self.view: list[str] = []
         self.store: TagStore | None = None
-        self.filter = Filter()
+        self.segment = "all"
+        self.sel_round = 0
         self.index = 0
         self.mode = G
         self.undo: list[tuple[str, callable]] = []
         self.editor: EditView | None = None
         self.edit_path: str | None = None
+        self.edit_return = G
         self.lossy_ok = False
-        self.fb_tags: tuple | None = None
+        self.combo_round = None
 
         self.single = SingleView()
+        self.single.navigate.connect(lambda d: self.mode == S and self.go(d))
+        self.single.back.connect(lambda: self.mode == S and self.set_mode(G))
+        self.single.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.single.customContextMenuRequested.connect(self._single_menu)
         self.model = GridModel(self)
-        self.grid = GridView(self.model, GridDelegate(self))
+        self.grid = GridView(self.model, GridDelegate())
         self.grid.selectionModel().currentChanged.connect(self._grid_current)
         self.grid.doubleClicked.connect(lambda i: self.set_mode(S))
+        self.grid.customContextMenuRequested.connect(self._grid_menu)
         self.stack = QStackedWidget()
         self.stack.addWidget(self.grid)
         self.stack.addWidget(self.single)
@@ -57,78 +79,151 @@ class MainWindow(QMainWindow):
         self.resize_timer = QTimer(self, singleShot=True, interval=150, timeout=self.show_current)
         self.single.canvas.resized.connect(self.resize_timer.start)
 
-        self.filterbar = QToolBar("Filter")
-        self.filterbar.setMovable(False)
-        box = QWidget()
-        self.fb_layout = QHBoxLayout(box)
-        self.fb_layout.setContentsMargins(4, 0, 4, 0)
-        self.filterbar.addWidget(box)
-        # rebuilt on the next loop turn: chips must not be deleted inside their own click signal
-        self.fb_timer = QTimer(self, singleShot=True, interval=0, timeout=self._build_filterbar)
-        self.addToolBar(self.filterbar)
+        self.help = HelpOverlay(self.stack)
         self._build_actions()
-        self.help = HelpOverlay(self.stack, [(k, d) for k, d, *_ in self.keymap])
+        self._build_toolbars()
         self.resize(1400, 900)
         self.open_target(Path(target or os.getcwd()))
 
-    # ---------- setup ----------
+    # ---------- actions and toolbars ----------
     def _build_actions(self):
-        km = [
-            (["Right"], "next", lambda: self.go(1), (S,)),
-            (["Left"], "previous", lambda: self.go(-1), (S,)),
-            (["Home"], "first", lambda: self.go_to(0), (S,)),
-            (["End"], "last", lambda: self.go_to(len(self.view) - 1), (S,)),
-            (["G"], "grid ↔ single view", lambda: self.set_mode(S if self.mode == G else G), BROWSE),
-            (["Return"], "open in single view", lambda: self.set_mode(S), (G,)),
-            (["Esc"], "back to grid / close help", self.escape, BROWSE),
-            (["F"], "toggle favourite ★", lambda: self.toggle_tag("fav"), BROWSE),
-            (["K"], "keep (and next)", lambda: self.verdict("keep"), BROWSE),
-            (["X"], "reject (and next)", lambda: self.verdict("reject"), BROWSE),
-            (["N"], "next round: continue with the kept ones", self.next_round, BROWSE),
-            (["1 … 9"], "toggle tag slot", None, BROWSE),
-            (["Ctrl+F"], "filter ★: off → only → without", lambda: self.cycle_filter("fav"), BROWSE),
-            (["Ctrl+1 … 9"], "filter tag slot: off → only → without", None, BROWSE),
-            (["Ctrl+U"], "filter: untagged only", self.toggle_untagged, BROWSE),
-            (["Ctrl+A"], "filter: any ↔ all tags", self.toggle_all, BROWSE),
-            (["Ctrl+0"], "clear filter", self.clear_filter, BROWSE),
-            (["/"], "show/hide filter bar", lambda: self.filterbar.setVisible(not self.filterbar.isVisible()), BROWSE),
-            (["M"], "move shown files to subfolder", self.move_view, BROWSE),
-            (["Del"], "move current to trash", self.trash, BROWSE),
-            (["Ctrl+Z"], "undo (move, round, rotate, edit, trash)", self.undo_last, BROWSE),
-            (["R"], "rotate 90° clockwise", lambda: self.transform("cw"), BROWSE),
-            (["L"], "rotate 90° counter-clockwise", lambda: self.transform("ccw"), BROWSE),
-            (["H"], "flip horizontal", lambda: self.transform("fliph"), BROWSE),
-            (["V"], "flip vertical", lambda: self.transform("flipv"), BROWSE),
-            (["E"], "edit: censor, pen, text, box, arrow", self.enter_edit, (S,)),
-            (["Space"], "video / GIF play/pause", self.single.toggle_play, (S,)),
-            ([","], "video −5 s", lambda: self.single.seek(-5000), (S,)),
-            (["."], "video +5 s", lambda: self.single.seek(5000), (S,)),
-            (["Ctrl+T"], "rename tag slots", self.edit_slots, BROWSE),
-            (["Ctrl+O"], "open folder", self.choose_folder, BROWSE),
-            (["F5"], "rescan folder", self.rescan, BROWSE),
-            (["F11"], "fullscreen", self.toggle_fullscreen, BROWSE),
-            (["?", "F1"], "this help", lambda: self.help.toggle(), BROWSE),
-            (["Ctrl+Q"], "quit", self.close, BROWSE),
+        defs = [
+            ("grid", "Übersicht", ["Esc"], ("view-grid",), "▦ Übersicht", self.to_grid, True),
+            ("single", "Einzelbild", ["Return"], ("view-preview",), "▣ Einzelbild", lambda: self.set_mode(S), True),
+            ("toggle", "Übersicht ↔ Einzelbild", ["G"], (), "", self.toggle_mode, False),
+            ("prev", "Vorheriges", ["Left"], ("go-previous",), "◀", lambda: self.go(-1), False),
+            ("next", "Nächstes", ["Right"], ("go-next",), "▶", lambda: self.go(1), False),
+            ("first", "Erstes", ["Home"], ("go-first",), "", lambda: self.go_to(0), False),
+            ("last", "Letztes", ["End"], ("go-last",), "", lambda: self.go_to(len(self.view) - 1), False),
+            ("reject", "Verwerfen", ["X"], ("dialog-cancel", "emblem-error"), "✗ Verwerfen",
+             lambda: self.verdict("reject"), True),
+            ("fav", "Favorit", ["F"], ("emblem-favorite", "rating"), "★ Favorit", self.toggle_fav, True),
+            ("keep", "Behalten", ["K"], ("dialog-ok-apply", "emblem-checked"), "✓ Behalten",
+             lambda: self.verdict("keep"), True),
+            ("rot_l", "Links drehen", ["L"], ("object-rotate-left",), "⟲", lambda: self.transform("ccw"), False),
+            ("rot_r", "Rechts drehen", ["R"], ("object-rotate-right",), "⟳", lambda: self.transform("cw"), False),
+            ("flip_h", "Horizontal spiegeln", ["H"], ("object-flip-horizontal",), "⇋",
+             lambda: self.transform("fliph"), False),
+            ("flip_v", "Vertikal spiegeln", ["V"], ("object-flip-vertical",), "⇵",
+             lambda: self.transform("flipv"), False),
+            ("edit", "Bearbeiten / Zensieren", ["E"], ("document-edit", "edit-image"), "✎ Bearbeiten",
+             self.enter_edit, False),
+            ("trash", "In den Papierkorb", ["Del"], ("user-trash", "edit-delete"), "🗑", self.trash, False),
+            ("undo", "Rückgängig", ["Ctrl+Z"], ("edit-undo",), "↶", self.undo_last, False),
+            ("move", "Verschieben…", ["M"], ("folder-move", "go-jump", "document-send"), "➜ Verschieben…",
+             self.move_view, False),
+            ("next_round", "Nächste Runde", ["N"], ("media-skip-forward", "arrow-right-double"), "⏭ Nächste Runde",
+             self.next_round, False),
+            ("play", "Abspielen / Pause", ["Space"], ("media-playback-start",), "⏯", self.single.toggle_play, False),
+            ("seek_b", "5 s zurück", [","], ("media-seek-backward",), "−5s", lambda: self.single.seek(-5000), False),
+            ("seek_f", "5 s vor", ["."], ("media-seek-forward",), "+5s", lambda: self.single.seek(5000), False),
+            ("open", "Ordner öffnen…", ["Ctrl+O"], ("document-open-folder",), "", self.choose_folder, False),
+            ("rescan", "Neu einlesen", ["F5"], ("view-refresh",), "", self.rescan, False),
+            ("reveal", "Im Dateimanager zeigen", [], ("system-file-manager",), "", self.reveal, False),
+            ("fullscreen", "Vollbild", ["F11"], ("view-fullscreen",), "", self.toggle_fullscreen, True),
+            ("help", "Tastenkürzel", ["?", "F1"], ("help-keyboard-shortcuts", "help-keybord-shortcuts",
+                                                   "input-keyboard"), "?", self.help.toggle, False),
+            ("quit", "Beenden", ["Ctrl+Q"], ("application-exit",), "", self.close, False),
         ]
-        for i in range(9):
-            km.append(([str(i + 1)], None, lambda i=i: self.toggle_tag(self.slots[i]), BROWSE))
-            km.append(([f"Ctrl+{i + 1}"], None, lambda i=i: self.cycle_filter(self.slots[i]), BROWSE))
-        self.keymap = [(" / ".join(k), d, f, m) for k, d, f, m in km if d]
-        self.actions_by_mode: list[tuple[QAction, tuple]] = []
-        for keys, desc, fn, modes in km:
-            if fn is None:
-                continue
-            a = QAction(desc or keys[0], self)
+        defs += [(f"seg_{sid}", label, [f"Ctrl+{i}"], (), label, lambda _=False, s=sid: self.set_segment(s), True)
+                 for i, (sid, label, *_) in enumerate(SEGMENTS)]
+        self.act: dict[str, QAction] = {}
+        modes = QActionGroup(self)
+        segs = QActionGroup(self)
+        for aid, label, keys, icons, fallback, fn, checkable in defs:
+            a = QAction(label, self, checkable=checkable)
             a.setShortcuts([QKeySequence(k) for k in keys])
             a.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
-            a.triggered.connect(fn)
+            a.setShortcutVisibleInContextMenu(True)
+            icon = theme_icon(*icons)
+            a.setIcon(icon)
+            if fallback and (icon.isNull() or aid.startswith("seg_")):
+                a.setIconText(fallback)
+            a.setToolTip(f"{label} ({keys_text(keys)})" if keys else label)
+            a.triggered.connect(lambda _=False, fn=fn: fn())
             self.addAction(a)
-            self.actions_by_mode.append((a, modes))
+            self.act[aid] = a
+            if aid in ("grid", "single"):
+                modes.addAction(a)
+            if aid.startswith("seg_"):
+                segs.addAction(a)
+        self.help.set_rows([(keys_text(keys), label) for aid, label, keys, *_ in defs if keys])
 
-    def _sync_actions(self):
-        for a, modes in self.actions_by_mode:
-            a.setEnabled(self.mode in modes)
-        self.filterbar.setEnabled(self.mode in BROWSE)
+    def _bar(self, title, area=Qt.ToolBarArea.TopToolBarArea) -> QToolBar:
+        tb = QToolBar(title)
+        tb.setMovable(False)
+        self.addToolBar(area, tb)
+        return tb
+
+    def _add(self, tb, aid, style=Qt.ToolButtonStyle.ToolButtonIconOnly):
+        a = self.act[aid]
+        tb.addAction(a)
+        btn = tb.widgetForAction(a)
+        btn.setToolButtonStyle(style if not a.icon().isNull() else Qt.ToolButtonStyle.ToolButtonTextOnly)
+        return btn
+
+    def _build_toolbars(self):
+        beside = Qt.ToolButtonStyle.ToolButtonTextBesideIcon
+        tb = self.top = self._bar("Werkzeuge")
+        self._add(tb, "grid", beside)
+        self._add(tb, "single", beside)
+        tb.addSeparator()
+        for aid in ("rot_l", "rot_r", "flip_h", "flip_v"):
+            self._add(tb, aid)
+        tb.addSeparator()
+        self._add(tb, "edit", beside)
+        tb.addSeparator()
+        self._add(tb, "trash")
+        self._add(tb, "undo")
+        tb.addWidget(spacer())
+        self._add(tb, "move", beside)
+        menu = QMenu(self)
+        for aid in ("open", "rescan", "reveal", "fullscreen", "help", None, "quit"):
+            menu.addSeparator() if aid is None else menu.addAction(self.act[aid])
+        self.menu_btn = QToolButton(popupMode=QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.menu_btn.setIcon(theme_icon("application-menu", "open-menu-symbolic"))
+        if self.menu_btn.icon().isNull():
+            self.menu_btn.setText("≡")
+        self.menu_btn.setToolTip("Menü")
+        self.menu_btn.setMenu(menu)
+        tb.addWidget(self.menu_btn)
+
+        self.addToolBarBreak()
+        sb = self.sichten = self._bar("Sichten")
+        for sid, *_ in SEGMENTS:
+            self._add(sb, f"seg_{sid}", Qt.ToolButtonStyle.ToolButtonTextOnly)
+        sb.addSeparator()
+        self.round_combo = QComboBox()
+        self.round_combo.setToolTip("Frühere Runden ansehen. Entscheiden geht nur in der aktuellen Runde.")
+        self.round_combo.currentIndexChanged.connect(self._round_selected)
+        sb.addWidget(self.round_combo)
+        self.progress_label = QLabel()
+        self.progress_label.setContentsMargins(10, 0, 6, 0)
+        sb.addWidget(self.progress_label)
+        self.progress = QProgressBar(maximumWidth=120, textVisible=False)
+        sb.addWidget(self.progress)
+        sb.addWidget(spacer())
+        self.next_round_btn = self._add(sb, "next_round", beside)
+
+        bb = self.bottom = self._bar("Entscheiden", Qt.ToolBarArea.BottomToolBarArea)
+        bb.setIconSize(QSize(24, 24))
+        bb.addWidget(spacer())
+        self._add(bb, "prev")
+        for aid in ("reject", "fav", "keep"):
+            btn = self._add(bb, aid, beside)
+            btn.setMinimumHeight(36)
+            f = btn.font()
+            f.setBold(True)
+            btn.setFont(f)
+        self._add(bb, "next")
+        bb.addSeparator()
+        for aid in ("play", "seek_b", "seek_f"):
+            self._add(bb, aid)
+        bb.addWidget(spacer())
+        self.position = QLabel()
+        self.position.setMinimumWidth(260)
+        self.position.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        bb.addWidget(self.position)
 
     # ---------- folder / view ----------
     def open_target(self, target: Path):
@@ -142,9 +237,9 @@ class MainWindow(QMainWindow):
         self.folder = folder.resolve()
         self.store = TagStore(self.folder)
         self.names = st.list_media(self.folder)
-        self.filter = Filter()
+        self.segment = "all"
+        self.sel_round = self.store.round
         self.undo.clear()
-        self.setWindowTitle(f"snapsort — {self.folder}")
         self.rebuild_view(select)
         self.set_mode(S if select else G)
         if self.store.warning:
@@ -164,12 +259,18 @@ class MainWindow(QMainWindow):
     def current(self) -> str | None:
         return self.view[self.index] if 0 <= self.index < len(self.view) else None
 
-    def matches(self, name) -> bool:
-        return self.filter.matches(self.store.tags(name), self.store.survived(name))
+    @property
+    def filter(self) -> Filter:
+        _, _, inc, exc = next(s for s in SEGMENTS if s[0] == self.segment)
+        return Filter(include=set(inc), exclude=set(exc), min_round=self.sel_round)
+
+    def round_set(self) -> list[str]:
+        return [n for n in self.names if self.store.survived(n) >= self.sel_round]
 
     def rebuild_view(self, keep=None):
         keep = keep or self.current()
-        self.view = [n for n in self.names if self.matches(n)]
+        f = self.filter
+        self.view = [n for n in self.names if f.matches(self.store.tags(n), self.store.survived(n))]
         if keep in self.view:
             self.index = self.view.index(keep)
         else:
@@ -177,7 +278,6 @@ class MainWindow(QMainWindow):
             self.index = later[0] if later else max(0, len(self.view) - 1) if keep else 0
         self.model.reset()
         self._select_grid()
-        self.refresh_filterbar(force=True)
         if not self.view and self.mode == S:
             self.set_mode(G)
         self.update_status()
@@ -193,6 +293,18 @@ class MainWindow(QMainWindow):
             self.index = cur.row()
             self.update_status()
 
+    def set_segment(self, sid):
+        self.segment = sid
+        self.rebuild_view()
+        self.show_current()
+
+    def _round_selected(self, i):
+        r = self.round_combo.itemData(i)
+        if r is not None and r != self.sel_round:
+            self.sel_round = r
+            self.rebuild_view()
+            self.show_current()
+
     # ---------- modes / navigation ----------
     def set_mode(self, mode):
         if mode == S and not self.view:
@@ -207,14 +319,16 @@ class MainWindow(QMainWindow):
             self.stack.setCurrentWidget(self.single)
             self.single.setFocus()
             self.show_current()
-        self._sync_actions()
         self.update_status()
 
-    def escape(self):
+    def to_grid(self):
         if self.help.isVisible():
             self.help.hide()
-        elif self.mode == S:
+        else:
             self.set_mode(G)
+
+    def toggle_mode(self):
+        self.set_mode(S if self.mode == G else G)
 
     def go(self, d):
         self.go_to(self.index + d)
@@ -223,6 +337,8 @@ class MainWindow(QMainWindow):
         if not self.view:
             return
         self.index = max(0, min(len(self.view) - 1, i))
+        if self.mode == G:
+            self._select_grid()
         self.show_current()
         self.update_status()
 
@@ -238,21 +354,21 @@ class MainWindow(QMainWindow):
             if img is not None:
                 self.single.canvas.show_image(img)
             elif p in self.loader.errors:
-                self.single.canvas.show_image(None, f"Cannot open {name}\n{self.loader.errors[p]}")
+                self.single.canvas.show_image(None, f"{name} lässt sich nicht öffnen\n{self.loader.errors[p]}")
             else:
-                self.single.canvas.show_image(self.loader.thumbs.get(p))
+                self.single.canvas.show_image(self.loader.thumbs.get(p), placeholder=True)
         n = len(self.view)
         order = [self.index] + [self.index + d for d in (1, -1, 2, 3, -2, 4)]
         self.loader.prefetch([self.path(self.view[i]) for i in order if 0 <= i < n], size)
 
     def _image_ready(self, path, img_or_msg):
         name = self.current()
-        if self.mode != S or name is None or path != self.path(name) or self.single.currentWidget() is not self.single.canvas:
+        if self.mode != S or name is None or path != self.path(name) \
+                or self.single.currentWidget() is not self.single.canvas:
             return
         if isinstance(img_or_msg, str):
-            if not img_or_msg:
-                return  # thumbnail failure
-            self.single.canvas.show_image(None, f"Cannot open {name}\n{img_or_msg}")
+            if img_or_msg:  # empty: thumbnail failure or skipped preload
+                self.single.canvas.show_image(None, f"{name} lässt sich nicht öffnen\n{img_or_msg}")
         else:
             self.single.canvas.show_image(img_or_msg)
 
@@ -260,165 +376,88 @@ class MainWindow(QMainWindow):
         name = self.current()
         if self.mode == S and name and path == self.path(name) and self.single.canvas.pix is None \
                 and path not in self.loader.cache:
-            self.single.canvas.show_image(img)
+            self.single.canvas.show_image(img, placeholder=True)
 
-    # ---------- tagging ----------
+    # ---------- deciding ----------
     def _changed(self, name):
         if name in self.view:
             self.model.refresh(self.view.index(name))
         if self.store.warning:
             self.flash(self.store.warning, 0)
-        self.refresh_filterbar()
         self.update_status()
 
-    def toggle_tag(self, tag):
+    def toggle_fav(self):
         name = self.current()
         if name:
-            self.store.toggle(name, tag)
+            self.store.toggle(name, "fav")
             self._changed(name)
 
     def verdict(self, tag):
         name = self.current()
-        if not name:
+        if not name or self.sel_round != self.store.round:
             return
         self.store.set_verdict(name, tag)
         self._changed(name)
-        if self.mode == S:
+        k, x, o = st.round_counts(self.store, self.round_set())
+        set_now = tag in self.store.tags(name)
+        if not o and set_now:
+            self.flash(f"Alle {k + x} entschieden – weiter mit „Nächste Runde“ (N)", 6000)
+        else:
+            self.flash(f"{name}: {('behalten' if tag == 'keep' else 'verworfen') if set_now else 'offen'}", 2000)
+        if set_now:
             self.go(1)
-        else:
-            i = min(self.index + 1, len(self.view) - 1)
-            self.index = i
-            self._select_grid()
-
-    # ---------- filter ----------
-    def cycle_filter(self, tag):
-        f = self.filter
-        if tag in f.include:
-            f.include.discard(tag)
-            f.exclude.add(tag)
-        elif tag in f.exclude:
-            f.exclude.discard(tag)
-        else:
-            f.include.add(tag)
-        self.rebuild_view()
-        self.show_current()
-
-    def toggle_untagged(self):
-        self.filter.untagged = not self.filter.untagged
-        self.rebuild_view()
-        self.show_current()
-
-    def toggle_all(self):
-        self.filter.mode_all = not self.filter.mode_all
-        self.rebuild_view()
-        self.show_current()
-
-    def set_min_round(self, v):
-        if v != self.filter.min_round:
-            self.filter.min_round = v
-            self.rebuild_view()
-            self.show_current()
-
-    def clear_filter(self):
-        self.filter = Filter(min_round=self.filter.min_round)
-        self.rebuild_view()
-        self.show_current()
-
-    def refresh_filterbar(self, force=False):
-        if force:
-            self.fb_tags = None
-        self.fb_timer.start()
-
-    def _build_filterbar(self):
-        f = self.filter
-        key = (frozenset(self.store.all_tags()), tuple(self.slots), len(self.view), self.store.round)
-        if key == self.fb_tags:
-            return
-        self.fb_tags = key
-        bar = self.fb_layout
-        while item := bar.takeAt(0):
-            if item.widget():
-                item.widget().deleteLater()
-        tags = ["fav", "keep", "reject"] + self.slots
-        tags += sorted(self.store.all_tags() | f.include | f.exclude)
-        for t in dict.fromkeys(tags):
-            b = QToolButton()
-            state = "include" if t in f.include else "exclude" if t in f.exclude else ""
-            b.setText(("★" if t == "fav" else t) + {"include": " ✓", "exclude": " ✗"}.get(state, ""))
-            col = {"include": "#2a7", "exclude": "#c33"}.get(state, "transparent")
-            b.setStyleSheet(f"QToolButton{{background:{col}; border-left:4px solid {tag_color(t, self.slots).name()};"
-                            f"padding:2px 6px; {'text-decoration:line-through;' if state == 'exclude' else ''}}}")
-            b.setToolTip("click: off → only → without")
-            b.clicked.connect(lambda _=False, t=t: self.cycle_filter(t))
-            bar.addWidget(b)
-        bar.addSpacing(12)
-        anyall = QToolButton(text="match ALL" if f.mode_all else "match ANY")
-        anyall.clicked.connect(self.toggle_all)
-        bar.addWidget(anyall)
-        unt = QCheckBox("untagged")
-        unt.setChecked(f.untagged)
-        unt.toggled.connect(lambda _: self.toggle_untagged())
-        bar.addWidget(unt)
-        rnd = QSpinBox(minimum=0, maximum=max(self.store.round, f.min_round), value=f.min_round)
-        rnd.setPrefix("round ≥ ")
-        rnd.valueChanged.connect(self.set_min_round)
-        bar.addWidget(rnd)
-        clear = QToolButton(text="clear")
-        clear.clicked.connect(self.clear_filter)
-        bar.addWidget(clear)
-        bar.addWidget(QLabel(f"  {len(self.view)} of {len(self.names)} shown"))
 
     # ---------- rounds ----------
     def next_round(self):
-        if not self.view:
+        if self.sel_round != self.store.round:
             return
-        keep, reject, undecided = st.round_counts(self.store, self.view)
-        box = QMessageBox(self)
-        box.setWindowTitle(f"Finish round {self.store.round}")
-        box.setText(f"{keep} kept, {reject} rejected, {undecided} undecided.\n"
-                    f"Round {self.store.round + 1} continues with the kept files.")
-        if undecided:
-            k = box.addButton("Undecided → keep", QMessageBox.ButtonRole.AcceptRole)
-            box.addButton("Undecided → reject", QMessageBox.ButtonRole.AcceptRole)
-        else:
-            k = box.addButton("Next round", QMessageBox.ButtonRole.AcceptRole)
-        cancel = box.addButton(QMessageBox.StandardButton.Cancel)
-        box.exec()
-        if box.clickedButton() in (cancel, None):
+        names = self.round_set()
+        k, x, o = st.round_counts(self.store, names)
+        r = self.store.round
+        keep_open = True
+        if o:
+            box = QMessageBox(self)
+            box.setWindowTitle(f"Runde {r + 1} abschließen")
+            box.setText(f"{k} behalten, {x} verworfen, <b>{o} noch offen</b>.<br>Was passiert mit den offenen?")
+            take = box.addButton("Offene mitnehmen", QMessageBox.ButtonRole.AcceptRole)
+            box.addButton("Offene aussortieren", QMessageBox.ButtonRole.AcceptRole)
+            cancel = box.addButton("Abbrechen", QMessageBox.ButtonRole.RejectRole)
+            box.setDefaultButton(take)
+            box.exec()
+            if box.clickedButton() in (cancel, None):
+                return
+            keep_open = box.clickedButton() is take
+        if not k and not (o and keep_open):
+            self.flash("Nichts behalten – mindestens ein Foto behalten", 6000)
             return
-        old_filter = self.filter
-        snap = st.next_round(self.store, self.view, undecided_keep=box.clickedButton() is k)
-        self.filter = Filter(min_round=self.store.round)
+        old = (self.segment, self.sel_round)
+        snap = st.next_round(self.store, names, undecided_keep=keep_open)
 
         def undo():
             st.restore_snapshot(self.store, snap)
-            self.filter = old_filter
-        self.push_undo(f"round {self.store.round}", undo)
+            self.segment, self.sel_round = old
+        self.push_undo(f"Runde {r + 2} starten", undo)
+        self.segment, self.sel_round = "all", self.store.round
         self.rebuild_view()
         self.index = 0
         self._select_grid()
         self.show_current()
-        self.flash(f"Round {self.store.round}: {len(self.view)} files")
+        self.flash(f"Runde {self.store.round + 1}: {len(self.view)} Fotos", 6000)
 
     # ---------- move / trash ----------
     def move_view(self):
         if not self.view:
             return
-        default = next(iter(sorted(self.filter.include)), None) or (
-            f"round{self.store.round}" if self.filter.min_round else "selected")
-        name, ok = QInputDialog.getText(self, "Move", f"Move {len(self.view)} files to {self.folder}/<name>/",
-                                        text=default)
-        name = name.strip()
-        if not ok:
+        recent = list(self.settings.value("recent_targets", []) or [])
+        if isinstance(recent, str):
+            recent = [recent]
+        d = MoveDialog(self, recent)
+        if not d.exec():
             return
-        if not name or "/" in name or name.startswith("."):
-            self.flash("Invalid folder name")
-            return
+        name = d.target()
         dst = self.folder / name
-        if dst.exists() and not dst.is_dir():
-            self.flash(f"{name} exists and is not a folder")
-            return
         res = st.execute_move(self.store, st.plan_move(self.view, dst), dst)
+        self.settings.setValue("recent_targets", [name] + [r for r in recent if r != name][:7])
         moved = {old for old, _ in res.moved}
         self.names = [n for n in self.names if n not in moved]
         for old in moved:
@@ -429,12 +468,16 @@ class MainWindow(QMainWindow):
             self.names = st.list_media(self.folder)
             if failed:
                 self.undo.clear()  # older entries may point at names that are now taken
-                raise OSError(f"could not restore {', '.join(failed)} (name taken); undo history cleared")
-        self.push_undo(f"move {len(res.moved)} files", undo)
-        self.filter = Filter()
+                raise OSError(f"{', '.join(failed)} nicht zurückgeholt (Name belegt); Verlauf geleert")
+        n = len(res.moved)
+        self.push_undo(f"Verschieben von {n} Fotos nach {name}/", undo)
+        self.segment = "all"
         self.rebuild_view()
         self.set_mode(G)
-        self.flash(f"Moved {len(res.moved)} files to {name}/" + (f" — stopped: {res.error}" if res.error else ""))
+        if res.error:
+            self.flash(f"Abgebrochen nach {n} von {len(d.names)}: {res.error}", 8000)
+        else:
+            self.flash(f"{n} Fotos nach {name}/ verschoben – Rückgängig mit Strg+Z", 8000)
 
     def trash(self):
         name = self.current()
@@ -443,7 +486,7 @@ class MainWindow(QMainWindow):
         self.single.stop()
         f = QFile(self.path(name))
         if not f.moveToTrash():
-            self.flash(f"Could not trash {name}: {f.errorString()}")
+            self.flash(f"{name} konnte nicht in den Papierkorb: {f.errorString()}")
             return
         trashed = Path(f.fileName())
         entry = self.store.files.pop(name, None)
@@ -453,37 +496,37 @@ class MainWindow(QMainWindow):
 
         def undo():
             if os.path.exists(self.path(name)):
-                raise FileExistsError(f"{name} exists again")
+                raise FileExistsError(f"{name} existiert wieder")
             os.rename(trashed, self.path(name))
             (trashed.parent.parent / "info" / f"{trashed.name}.trashinfo").unlink(missing_ok=True)
             if entry:
                 self.store.files[name] = entry
                 self.store.save()
             self.names = st.list_media(self.folder)
-        self.push_undo(f"trash {name}", undo)
+        self.push_undo(f"{name} in den Papierkorb", undo)
         self.rebuild_view()
         self.show_current()
-        self.flash(f"Trashed {name}")
+        self.flash(f"{name} in den Papierkorb verschoben – Rückgängig mit Strg+Z", 6000)
 
     # ---------- undo ----------
     def push_undo(self, label, fn):
         self.undo.append((label, fn))
         del self.undo[:-UNDO_LIMIT]
+        self.update_status()
 
     def undo_last(self):
         if not self.undo:
-            self.flash("Nothing to undo")
             return
         label, fn = self.undo.pop()
         try:
             fn()
         except OSError as e:
-            self.flash(f"Undo failed: {e}", 0)
+            self.flash(f"Rückgängig fehlgeschlagen: {e}", 0)
             self.rebuild_view()
             return
         self.rebuild_view()
         self.show_current()
-        self.flash(f"Undid: {label}")
+        self.flash(f"Rückgängig: {label}")
 
     def _restore_bytes(self, p, data):
         stamp = os.stat(p)
@@ -492,7 +535,7 @@ class MainWindow(QMainWindow):
         def undo():
             now = os.stat(p)
             if (now.st_size, now.st_mtime_ns) != sig:
-                raise OSError(f"{Path(p).name} changed since, not restored")
+                raise OSError(f"{Path(p).name} wurde seitdem geändert, nicht wiederhergestellt")
             st.atomic_write(p, data)
             self.loader.invalidate(p)
         return undo
@@ -506,8 +549,8 @@ class MainWindow(QMainWindow):
         ext = Path(name).suffix.lower()
         if ext not in (".jpg", ".jpeg", ".png") and not self.lossy_ok:
             if QMessageBox.question(
-                    self, "Rotate", f"Rotating {ext} re-encodes the file: slight quality loss and its "
-                    "metadata (capture date, GPS) is removed. Continue for this session?") \
+                    self, "Drehen", f"Drehen von {ext} speichert neu: leichter Qualitätsverlust, "
+                    "Aufnahmedatum und GPS gehen verloren. Für diese Sitzung erlauben?") \
                     != QMessageBox.StandardButton.Yes:
                 return
             self.lossy_ok = True
@@ -515,39 +558,41 @@ class MainWindow(QMainWindow):
         try:
             original = imaging.transform_file(p, op)
         except OSError as e:
-            self.flash(f"Cannot {op} {name}: {e}")
+            self.flash(f"{name} lässt sich nicht drehen: {e}")
             return
         finally:
             QGuiApplication.restoreOverrideCursor()
-        self.push_undo(f"{op} {name}", self._restore_bytes(p, original))
+        label = {"cw": "rechts gedreht", "ccw": "links gedreht", "fliph": "gespiegelt", "flipv": "gespiegelt"}[op]
+        self.push_undo(f"{name} {label}", self._restore_bytes(p, original))
         self.loader.invalidate(p)
         self._changed(name)
         self.show_current()
 
     def enter_edit(self):
         name = self.current()
-        if not name:
+        if not name or self.mode == E:
             return
         p = self.path(name)
         if why := imaging.editable(p):
-            self.flash(f"Cannot edit: {why}")
+            self.flash(f"Bearbeiten nicht möglich: {why}")
             return
         QGuiApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             img = imaging.decode_scaled(p)
         except OSError as e:
-            self.flash(f"Cannot edit: {e}")
+            self.flash(f"Bearbeiten nicht möglich: {e}")
             return
         finally:
             QGuiApplication.restoreOverrideCursor()
+        self.single.stop()
+        self.edit_return = self.mode
         self.edit_path = p
         self.editor = EditView(img)
         self.editor.save_requested.connect(self.save_edit)
         self.editor.close_requested.connect(self.close_edit)
         self.stack.addWidget(self.editor)
         self.stack.setCurrentWidget(self.editor)
-        self.mode = "edit"
-        self._sync_actions()
+        self.mode = E
         self.editor.canvas.setFocus()
         self.update_status()
 
@@ -557,19 +602,24 @@ class MainWindow(QMainWindow):
         try:
             original = imaging.save_edited(p, self.editor.image)
         except OSError as e:
-            self.flash(f"Save failed: {e}", 8000)
+            self.flash(f"Speichern fehlgeschlagen: {e}", 8000)
             return
         finally:
             QGuiApplication.restoreOverrideCursor()
-        self.push_undo(f"edit {Path(p).name}", self._restore_bytes(p, original))
+        self.push_undo(f"Bearbeitung von {Path(p).name}", self._restore_bytes(p, original))
         self.loader.invalidate(p)
         self._leave_edit()
-        self.flash(f"Saved {Path(p).name}")
+        self.flash(f"{Path(p).name} gespeichert (Original überschrieben) – Rückgängig mit Strg+Z", 6000)
 
     def close_edit(self):
-        if self.editor.dirty and QMessageBox.question(self, "Discard edits?", "Discard unsaved edits?") \
-                != QMessageBox.StandardButton.Yes:
-            return
+        if self.editor.dirty:
+            box = QMessageBox(QMessageBox.Icon.Question, "Änderungen verwerfen?",
+                              "Die Änderungen sind noch nicht gespeichert.", parent=self)
+            discard = box.addButton("Verwerfen", QMessageBox.ButtonRole.DestructiveRole)
+            box.addButton("Weiter bearbeiten", QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            if box.clickedButton() is not discard:
+                return
         self._leave_edit()
 
     def _leave_edit(self):
@@ -577,33 +627,42 @@ class MainWindow(QMainWindow):
         self.editor.deleteLater()
         self.editor = None
         self.edit_path = None
-        self.set_mode(S)
-        self.update_status()
+        self.set_mode(self.edit_return)
+        if self.mode == G:
+            self.model.refresh(self.index) if self.view else None
 
-    # ---------- misc ----------
-    def edit_slots(self):
-        d = QDialog(self)
-        d.setWindowTitle("Tag slots")
-        form = QFormLayout(d)
-        edits = [QLineEdit(s) for s in self.slots]
-        for i, e in enumerate(edits):
-            form.addRow(f"{i + 1}:", e)
-        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        bb.accepted.connect(d.accept)
-        bb.rejected.connect(d.reject)
-        form.addRow(bb)
-        if d.exec():
-            new = [e.text().strip() or old for e, old in zip(edits, self.slots)]
-            if len(set(new)) != 9 or set(new) & {"fav", "keep", "reject"}:
-                self.flash("Slot names must be unique and not fav/keep/reject")
-                return
-            self.slots = new
-            self.settings.setValue("slots", new)
-            self.refresh_filterbar()
-            self.grid.viewport().update()
+    # ---------- menus / misc ----------
+    def _menu(self, ids, pos_widget, pos):
+        m = QMenu(self)
+        for aid in ids:
+            m.addSeparator() if aid is None else m.addAction(self.act[aid])
+        m.exec(pos_widget.mapToGlobal(pos))
+
+    def _grid_menu(self, pos):
+        idx = self.grid.indexAt(pos)
+        if not idx.isValid():
+            self._menu(["move", None, "open", "rescan"], self.grid.viewport(), pos)
+            return
+        self.grid.setCurrentIndex(idx)
+        self._menu(["single", None, "keep", "reject", "fav", None, "rot_l", "rot_r", "flip_h", "flip_v", "edit",
+                    None, "reveal", "trash"], self.grid.viewport(), pos)
+
+    def _single_menu(self, pos):
+        self._menu(["grid", None, "keep", "reject", "fav", None, "rot_l", "rot_r", "flip_h", "flip_v", "edit",
+                    None, "reveal", "fullscreen", "trash"], self.single, pos)
+
+    def reveal(self):
+        name = self.current()
+        if not name:
+            return
+        uri = QUrl.fromLocalFile(self.path(name)).toString()
+        reply = QDBusInterface("org.freedesktop.FileManager1", "/org/freedesktop/FileManager1",
+                               "org.freedesktop.FileManager1").call("ShowItems", [uri], "")
+        if reply.type() != QDBusMessage.MessageType.ReplyMessage:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.folder)))
 
     def choose_folder(self):
-        d = QFileDialog.getExistingDirectory(self, "Open folder", str(self.folder))
+        d = QFileDialog.getExistingDirectory(self, "Ordner öffnen", str(self.folder))
         if d:
             self.open_folder(Path(d))
 
@@ -613,33 +672,97 @@ class MainWindow(QMainWindow):
     def flash(self, msg, ms=4000):
         self.statusBar().showMessage(msg, ms)
 
+    # ---------- state -> widgets ----------
     def update_status(self):
-        name = self.current()
-        if self.mode == "edit":
-            text = f"EDIT {name} · P pen · B box · A arrow · T text · C censor · U blur · [ ] width · " \
-                   "Ctrl+Z undo · Ctrl+S save (overwrites) · Esc cancel"
-        elif name is None:
-            text = f"0/{len(self.names)} — nothing matches the filter (Ctrl+0 clears)" if self.names else \
-                "No images or videos in this folder (Ctrl+O opens another)"
+        if self.store is None:
+            return
+        cur = self.current()
+        m = self.mode
+        browse = m in (S, G)
+        kind = kind_of(cur) if cur else None
+        in_round = self.sel_round == self.store.round
+        names = self.round_set()
+        k, x, o = st.round_counts(self.store, names)
+        tags = self.store.tags(cur) if cur else set()
+        n = len(self.view)
+        playing = self.single.kind() if m == S else None
+        enabled = {
+            "grid": browse, "single": browse and n > 0, "toggle": browse and n > 0,
+            "prev": m == S and self.index > 0, "next": m == S and self.index < n - 1,
+            "first": m == S, "last": m == S,
+            "keep": browse and cur is not None and in_round, "reject": browse and cur is not None and in_round,
+            "fav": browse and cur is not None,
+            "rot_l": browse and kind == "image", "rot_r": browse and kind == "image",
+            "flip_h": browse and kind == "image", "flip_v": browse and kind == "image",
+            "edit": browse and kind == "image", "trash": browse and cur is not None,
+            "undo": browse and bool(self.undo), "move": browse and n > 0,
+            "next_round": browse and in_round and bool(names) and bool(k or o),
+            "play": playing in ("video", "anim"), "seek_b": playing == "video", "seek_f": playing == "video",
+            "open": browse, "rescan": browse, "reveal": browse and cur is not None,
+        }
+        for aid, a in self.act.items():
+            a.setEnabled(enabled.get(aid, browse if aid.startswith("seg_") else True))
+        for aid in ("play", "seek_b", "seek_f"):
+            self.act[aid].setVisible(enabled[aid])
+        self.act["grid"].setChecked(m == G)
+        self.act["single"].setChecked(m == S)
+        for aid in ("keep", "reject", "fav"):
+            self.act[aid].setChecked(aid in tags)
+        self.act["fullscreen"].setChecked(self.isFullScreen())
+        self.act["move"].setText(f"Verschieben… ({n})")
+        self.act["move"].setToolTip(f"Die {n} angezeigten Fotos in einen Unterordner verschieben (M)")
+        self.act["undo"].setToolTip(f"Rückgängig: {self.undo[-1][0]} (Strg+Z)" if self.undo else "Rückgängig (Strg+Z)")
+        if not names or (not k and not o):
+            self.act["next_round"].setToolTip("Nichts behalten – mindestens ein Foto behalten")
         else:
-            tags = self.store.tags(name)
-            user = sorted(tags - {"fav", *st.VERDICTS})
-            parts = [f"{self.index + 1}/{len(self.view)}", name]
-            if "fav" in tags or user:
-                parts.append(" ".join(["★"] * ("fav" in tags) + [", ".join(user)]).strip())
-            parts += [v.upper() for v in st.VERDICTS if v in tags]
-            if s := self.store.survived(name):
-                parts.append(f"survived {s}")
-            parts.append(f"round {self.store.round}")
-            parts.append(f"filter: {self.filter.describe()}")
-            if not self.matches(name):
-                parts.append("(filtered out)")
-            parts.append("? help")
-            text = " · ".join(parts)
-        if not hasattr(self, "status_label"):
-            self.status_label = QLabel()
-            self.statusBar().addPermanentWidget(self.status_label, 1)
-        self.status_label.setText(text)
+            self.act["next_round"].setToolTip("Mit den behaltenen Fotos weitermachen (N)")
+        f = self.next_round_btn.font()
+        f.setBold(in_round and not o and k > 0)
+        self.next_round_btn.setFont(f)
+
+        counts = {"all": len(names), "open": o, "keep": k, "reject": x,
+                  "fav": sum("fav" in self.store.tags(nm) for nm in names)}
+        for sid, label, *_ in SEGMENTS:
+            a = self.act[f"seg_{sid}"]
+            a.setIconText(f"{label} {counts[sid]}")
+            a.setChecked(sid == self.segment)
+        if self.combo_round != self.store.round:
+            self.combo_round = self.store.round
+            self.round_combo.blockSignals(True)
+            self.round_combo.clear()
+            for r in range(self.store.round + 1):
+                cnt = sum(self.store.survived(nm) >= r for nm in self.names)
+                self.round_combo.addItem(f"Runde {r + 1} ({cnt})", r)
+            self.round_combo.blockSignals(False)
+        self.round_combo.blockSignals(True)
+        self.round_combo.setCurrentIndex(self.sel_round)
+        self.round_combo.blockSignals(False)
+        if in_round:
+            self.progress_label.setText(f"Runde {self.sel_round + 1} · {k} behalten · {x} verworfen · {o} offen")
+        else:
+            self.progress_label.setText(f"Runde {self.sel_round + 1} (abgeschlossen) · {len(names)} Fotos")
+        self.progress.setVisible(in_round)
+        self.progress.setMaximum(max(1, len(names)))
+        self.progress.setValue(k + x)
+
+        self.sichten.setVisible(m != E)
+        self.bottom.setVisible(m != E)
+        self.top.setVisible(m != E)
+        self.single.canvas.set_tags(tags)
+        if cur:
+            text = f"{self.index + 1} / {n} · {cur}"
+            self.position.setText(self.position.fontMetrics().elidedText(
+                text, Qt.TextElideMode.ElideMiddle, self.position.width() or 260))
+        else:
+            self.position.setText("")
+        if not self.names:
+            self.grid.show_empty("Keine Fotos oder Videos in diesem Ordner.\n\nAnderen Ordner öffnen: Strg+O")
+        elif not self.view:
+            label = next(s[1] for s in SEGMENTS if s[0] == self.segment)
+            self.grid.show_empty(f"Keine Fotos in „{label}“.\n\nAlle anzeigen: Strg+0")
+        else:
+            self.grid.show_empty("")
+        self.setWindowTitle(f"{self.folder.name} – Runde {self.store.round + 1} – snapsort")
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
@@ -649,7 +772,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, e):
         self.single.stop()
         if self.editor and self.editor.dirty and QMessageBox.question(
-                self, "Quit", "Discard unsaved edits?") != QMessageBox.StandardButton.Yes:
+                self, "Beenden", "Ungespeicherte Änderungen verwerfen?") != QMessageBox.StandardButton.Yes:
             e.ignore()
             return
         self.loader.decode_pool.clear()
@@ -657,6 +780,75 @@ class MainWindow(QMainWindow):
         self.loader.decode_pool.waitForDone(2000)
         self.loader.thumb_pool.waitForDone(2000)
         super().closeEvent(e)
+
+
+class MoveDialog(QDialog):
+    def __init__(self, win: MainWindow, recent: list[str]):
+        super().__init__(win)
+        self.win = win
+        self.names = list(win.view)
+        folder = win.folder
+        self.setWindowTitle("In Unterordner verschieben")
+        seg = next(s[1] for s in SEGMENTS if s[0] == win.segment)
+        lay = QVBoxLayout(self)
+        summary = QLabel(f"<b>{len(self.names)} Fotos</b> aus „{folder.name}“ (Ansicht: {seg}, "
+                         f"Runde {win.sel_round + 1}) verschieben nach:")
+        summary.setWordWrap(True)
+        lay.addWidget(summary)
+        row = QHBoxLayout()
+        row.addWidget(QLabel(f"{folder.name}/"))
+        self.combo = QComboBox(editable=True)
+        subdirs = sorted((d.name for d in folder.iterdir() if d.is_dir() and not d.name.startswith(".")),
+                         key=st.natural_key)
+        self.combo.addItems(list(dict.fromkeys(recent + subdirs)))
+        default = {"fav": "Favoriten", "keep": "Auswahl"}.get(win.segment) or (recent[0] if recent else "Auswahl")
+        self.combo.setEditText(default)
+        self.combo.setMinimumWidth(260)
+        row.addWidget(self.combo, 1)
+        lay.addLayout(row)
+        self.hint = QLabel()
+        lay.addWidget(self.hint)
+        preview = QListWidget(viewMode=QListView.ViewMode.IconMode, flow=QListView.Flow.LeftToRight,
+                              wrapping=False, selectionMode=QListWidget.SelectionMode.NoSelection)
+        preview.setIconSize(QSize(64, 64))
+        preview.setFixedHeight(96)
+        grey = QPixmap(64, 64)
+        grey.fill(Qt.GlobalColor.darkGray)
+        for nm in self.names[:50]:
+            thumb = win.loader.thumbs.get(win.path(nm))
+            pm = QPixmap.fromImage(thumb) if thumb is not None else grey
+            preview.addItem(QListWidgetItem(QIcon(pm), ""))
+        if len(self.names) > 50:
+            preview.addItem(f"… und {len(self.names) - 50} weitere")
+        lay.addWidget(preview)
+        self.buttons = QDialogButtonBox()
+        self.buttons.addButton("Abbrechen", QDialogButtonBox.ButtonRole.RejectRole)
+        self.ok = self.buttons.addButton(f"{len(self.names)} Fotos verschieben", QDialogButtonBox.ButtonRole.AcceptRole)
+        self.ok.setIcon(win.act["move"].icon())
+        self.ok.setDefault(True)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        lay.addWidget(self.buttons)
+        self.combo.editTextChanged.connect(self._validate)
+        self._validate()
+        self.resize(560, self.sizeHint().height())
+
+    def target(self) -> str:
+        return self.combo.currentText().strip()
+
+    def _validate(self):
+        name = self.target()
+        dst = self.win.folder / name if name else None
+        if not name or "/" in name or name.startswith("."):
+            msg, ok = "⚠ Ungültiger Name", False
+        elif dst.exists() and not dst.is_dir():
+            msg, ok = "⚠ Existiert als Datei", False
+        elif dst.exists():
+            msg, ok = "Ordner existiert – Fotos werden hinzugefügt", True
+        else:
+            msg, ok = "Neuer Ordner wird angelegt", True
+        self.hint.setText(msg)
+        self.ok.setEnabled(ok)
 
 
 def resolve_target(arg: str | None) -> Path:
@@ -670,7 +862,7 @@ def resolve_target(arg: str | None) -> Path:
         return Path(url.toLocalFile())
     reply = QDBusInterface("org.kde.KIOFuse", "/org/kde/KIOFuse", "org.kde.KIOFuse.VFS").call("mountUrl", arg)
     if reply.type() != QDBusMessage.MessageType.ReplyMessage or not reply.arguments():
-        raise OSError(f"kio-fuse could not mount {arg}: {reply.errorMessage() or 'no reply'}")
+        raise OSError(f"kio-fuse konnte {arg} nicht einbinden: {reply.errorMessage() or 'keine Antwort'}")
     return Path(reply.arguments()[0])
 
 
@@ -682,10 +874,10 @@ def main():
     try:
         target = resolve_target(arg)
         if not target.exists():
-            raise OSError(f"{target} does not exist")
+            raise OSError(f"{target} existiert nicht")
     except OSError as e:
         QMessageBox.critical(None, "snapsort", str(e))
-        d = QFileDialog.getExistingDirectory(None, "Open folder", str(Path.home()))
+        d = QFileDialog.getExistingDirectory(None, "Ordner öffnen", str(Path.home()))
         if not d:
             sys.exit(1)
         target = Path(d)
