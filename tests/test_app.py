@@ -225,3 +225,35 @@ def test_undo_refuses_to_overwrite_changed_file(win):
     p.write_bytes(b"changed by someone else")
     key(win, Qt.Key.Key_Z, Qt.KeyboardModifier.ControlModifier)
     assert p.read_bytes() == b"changed by someone else"
+
+
+def test_move_refilters_decisions_made_since(win, monkeypatch):
+    monkeypatch.setattr(app_mod.MoveDialog, "exec", lambda self: (self.combo.setEditText("best"), 1)[1])
+    win.store.set_verdict("a1.png", "keep")
+    win.store.set_verdict("a2.png", "keep")
+    win.set_segment("keep")
+    key(win, Qt.Key.Key_X)  # a1 rejected while "Behalten" is shown; it stays visible until refiltered
+    key(win, Qt.Key.Key_M)
+    assert sorted(p.name for p in (win.folder / "best").iterdir() if p.suffix == ".png") == ["a2.png"]
+
+
+def test_move_failure_is_reported(win, monkeypatch):
+    monkeypatch.setattr(app_mod.MoveDialog, "exec", lambda self: (self.combo.setEditText("x" * 300), 1)[1])
+    key(win, Qt.Key.Key_M)
+    assert "fehlgeschlagen" in win.statusBar().currentMessage() and win.names == NAMES
+
+
+def test_open_other_folder_starts_at_first(win, tmp_path):
+    other = tmp_path / "other"
+    other.mkdir()
+    for n in ("c0.png", "c1.png", "c2.png", "c3.png"):
+        (other / n).write_bytes(imaging.encode(noise(8, 8, 0), "png"))
+    win.go_to(3)
+    win.open_folder(other)
+    assert win.index == 0 and win.round_combo.itemText(0) == "Runde 1 (4)"
+
+
+def test_help_disabled_while_editing(win):
+    key(win, Qt.Key.Key_Return)
+    key(win, Qt.Key.Key_E)
+    assert not win.act["help"].isEnabled()

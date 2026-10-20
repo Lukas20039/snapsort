@@ -233,13 +233,21 @@ class MainWindow(QMainWindow):
         self.open_folder(target, select)
 
     def open_folder(self, folder: Path, select=None):
+        folder = folder.resolve()
+        try:
+            names = st.list_media(folder)
+        except OSError as e:
+            self.flash(f"Ordner lässt sich nicht lesen: {e}", 8000)
+            return
         self.single.stop()
-        self.folder = folder.resolve()
-        self.store = TagStore(self.folder)
-        self.names = st.list_media(self.folder)
+        self.help.hide()
+        self.folder, self.names = folder, names
+        self.store = TagStore(folder)
         self.segment = "all"
         self.sel_round = self.store.round
+        self.combo_round = None
         self.undo.clear()
+        self.view, self.index = [], 0
         self.rebuild_view(select)
         self.set_mode(S if select else G)
         if self.store.warning:
@@ -302,6 +310,7 @@ class MainWindow(QMainWindow):
         r = self.round_combo.itemData(i)
         if r is not None and r != self.sel_round:
             self.sel_round = r
+            self.segment = "all"  # verdicts belong to the current round only
             self.rebuild_view()
             self.show_current()
 
@@ -324,6 +333,7 @@ class MainWindow(QMainWindow):
     def to_grid(self):
         if self.help.isVisible():
             self.help.hide()
+            self.update_status()
         else:
             self.set_mode(G)
 
@@ -432,20 +442,23 @@ class MainWindow(QMainWindow):
             return
         old = (self.segment, self.sel_round)
         snap = st.next_round(self.store, names, undecided_keep=keep_open)
+        if self.store.warning:
+            self.flash(self.store.warning, 0)
 
         def undo():
             st.restore_snapshot(self.store, snap)
             self.segment, self.sel_round = old
         self.push_undo(f"Runde {r + 2} starten", undo)
         self.segment, self.sel_round = "all", self.store.round
+        self.view, self.index = [], 0
         self.rebuild_view()
-        self.index = 0
-        self._select_grid()
         self.show_current()
-        self.flash(f"Runde {self.store.round + 1}: {len(self.view)} Fotos", 6000)
+        if not self.store.warning:
+            self.flash(f"Runde {self.store.round + 1}: {len(self.view)} Fotos", 6000)
 
     # ---------- move / trash ----------
     def move_view(self):
+        self.rebuild_view()  # decisions made since the last filter change must count
         if not self.view:
             return
         recent = list(self.settings.value("recent_targets", []) or [])
@@ -456,7 +469,11 @@ class MainWindow(QMainWindow):
             return
         name = d.target()
         dst = self.folder / name
-        res = st.execute_move(self.store, st.plan_move(self.view, dst), dst)
+        try:
+            res = st.execute_move(self.store, st.plan_move(d.names, dst), dst)
+        except OSError as e:
+            self.flash(f"Verschieben fehlgeschlagen: {e}", 8000)
+            return
         self.settings.setValue("recent_targets", [name] + [r for r in recent if r != name][:7])
         moved = {old for old, _ in res.moved}
         self.names = [n for n in self.names if n not in moved]
@@ -585,6 +602,7 @@ class MainWindow(QMainWindow):
         finally:
             QGuiApplication.restoreOverrideCursor()
         self.single.stop()
+        self.help.hide()
         self.edit_return = self.mode
         self.edit_path = p
         self.editor = EditView(img)
@@ -698,10 +716,10 @@ class MainWindow(QMainWindow):
             "undo": browse and bool(self.undo), "move": browse and n > 0,
             "next_round": browse and in_round and bool(names) and bool(k or o),
             "play": playing in ("video", "anim"), "seek_b": playing == "video", "seek_f": playing == "video",
-            "open": browse, "rescan": browse, "reveal": browse and cur is not None,
+            "open": browse, "rescan": browse, "reveal": browse and cur is not None, "help": browse,
         }
         for aid, a in self.act.items():
-            a.setEnabled(enabled.get(aid, browse if aid.startswith("seg_") else True))
+            a.setEnabled(enabled.get(aid, browse and in_round if aid.startswith("seg_") else True))
         for aid in ("play", "seek_b", "seek_f"):
             self.act[aid].setVisible(enabled[aid])
         self.act["grid"].setChecked(m == G)
@@ -726,8 +744,9 @@ class MainWindow(QMainWindow):
             a = self.act[f"seg_{sid}"]
             a.setIconText(f"{label} {counts[sid]}")
             a.setChecked(sid == self.segment)
-        if self.combo_round != self.store.round:
-            self.combo_round = self.store.round
+        combo_key = (self.folder, self.store.round, len(self.names))
+        if self.combo_round != combo_key:
+            self.combo_round = combo_key
             self.round_combo.blockSignals(True)
             self.round_combo.clear()
             for r in range(self.store.round + 1):
@@ -798,10 +817,10 @@ class MoveDialog(QDialog):
         row = QHBoxLayout()
         row.addWidget(QLabel(f"{folder.name}/"))
         self.combo = QComboBox(editable=True)
-        subdirs = sorted((d.name for d in folder.iterdir() if d.is_dir() and not d.name.startswith(".")),
-                         key=st.natural_key)
+        with os.scandir(folder) as it:  # one listing, no stat per entry on network mounts
+            subdirs = sorted((e.name for e in it if e.is_dir() and not e.name.startswith(".")), key=st.natural_key)
         self.combo.addItems(list(dict.fromkeys(recent + subdirs)))
-        default = {"fav": "Favoriten", "keep": "Auswahl"}.get(win.segment) or (recent[0] if recent else "Auswahl")
+        default = {"fav": "Favoriten", "keep": "Auswahl", "reject": "Aussortiert"}.get(win.segment) or (recent[0] if recent else "Auswahl")
         self.combo.setEditText(default)
         self.combo.setMinimumWidth(260)
         row.addWidget(self.combo, 1)
