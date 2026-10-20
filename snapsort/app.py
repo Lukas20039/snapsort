@@ -607,6 +607,7 @@ class MainWindow(QMainWindow):
         self.edit_path = p
         self.editor = EditView(img)
         self.editor.save_requested.connect(self.save_edit)
+        self.editor.save_copy_requested.connect(self.save_edit_copy)
         self.editor.close_requested.connect(self.close_edit)
         self.stack.addWidget(self.editor)
         self.stack.setCurrentWidget(self.editor)
@@ -628,6 +629,30 @@ class MainWindow(QMainWindow):
         self.loader.invalidate(p)
         self._leave_edit()
         self.flash(f"{Path(p).name} gespeichert (Original überschrieben) – Rückgängig mit Strg+Z", 6000)
+
+    def save_edit_copy(self):
+        src = Path(self.edit_path)
+        name = st.free_name(f"{src.stem}_{self.editor.copy_tag}{src.suffix}", src.parent, set())
+        dest = src.parent / name
+        QGuiApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            imaging.save_edited(src, self.editor.image, dest)
+        except OSError as e:
+            self.flash(f"Speichern fehlgeschlagen: {e}", 8000)
+            return
+        finally:
+            QGuiApplication.restoreOverrideCursor()
+
+        def undo():
+            f = QFile(str(dest))
+            if dest.exists() and not f.moveToTrash():
+                raise OSError(f"{name} konnte nicht in den Papierkorb: {f.errorString()}")
+            self.names = st.list_media(self.folder)
+        self.push_undo(f"Kopie {name}", undo)
+        self.names = st.list_media(self.folder)
+        self._leave_edit()
+        self.rebuild_view()
+        self.flash(f"Kopie gespeichert: {name} – Original unverändert", 6000)
 
     def close_edit(self):
         if self.editor.dirty:

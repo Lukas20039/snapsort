@@ -75,12 +75,12 @@ def apply_op(img: QImage, op: str) -> QImage:
     return img.flipped(Qt.Orientation.Horizontal if op == "fliph" else Qt.Orientation.Vertical)
 
 
-def _write_reencoded(path, img: QImage, original: bytes):
+def _write_reencoded(path, img: QImage, original: bytes, dest=None):
     fmt = _fmt(path)
     data = encode(img, fmt)
     if Path(path).suffix.lower() in JPEG_EXT:
         data = exif.splice_metadata(data, original)
-    atomic_write(path, data)
+    atomic_write(dest or path, data)
 
 
 def transform_file(path, op: str) -> bytes:
@@ -125,9 +125,10 @@ def transform_file(path, op: str) -> bytes:
     return original
 
 
-def save_edited(path, img: QImage) -> bytes:
+def save_edited(path, img: QImage, dest=None) -> bytes:
+    """Write img over path (or to dest, keeping path's format and metadata). Returns path's bytes."""
     original = Path(path).read_bytes()
-    _write_reencoded(path, img, original)
+    _write_reencoded(path, img, original, dest)
     return original
 
 

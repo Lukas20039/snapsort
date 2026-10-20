@@ -186,7 +186,7 @@ def restore_snapshot(store, snap) -> None:
     store.save()
 
 
-def _free_name(name, dst: Path, taken: set) -> str:
+def free_name(name, dst: Path, taken: set) -> str:
     p = Path(name)
     cand, i = name, 0
     while cand in taken or (dst / cand).exists():
@@ -198,7 +198,7 @@ def _free_name(name, dst: Path, taken: set) -> str:
 def plan_move(names, dst_dir) -> list[tuple[str, str]]:
     dst, taken, plan = Path(dst_dir), set(), []
     for n in names:
-        new = _free_name(n, dst, taken)
+        new = free_name(n, dst, taken)
         taken.add(new)
         plan.append((n, new))
     return plan
@@ -222,7 +222,7 @@ def execute_move(store, plan, dst_dir) -> MoveResult:
     for old, new in plan:
         if (dst / new).exists():
             # ponytail: exists-check+rename has a TOCTOU window; fine single-user
-            new = _free_name(old, dst, taken)
+            new = free_name(old, dst, taken)
             taken.add(new)
         try:
             os.rename(store.folder / old, dst / new)

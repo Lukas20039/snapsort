@@ -257,3 +257,17 @@ def test_help_disabled_while_editing(win):
     key(win, Qt.Key.Key_Return)
     key(win, Qt.Key.Key_E)
     assert not win.act["help"].isEnabled()
+
+
+def test_save_as_copy_keeps_original(win):
+    p = win.folder / "a1.png"
+    before = p.read_bytes()
+    key(win, Qt.Key.Key_Return)
+    key(win, Qt.Key.Key_E)
+    win.editor.set_tool("format")
+    win.editor.apply_crop()
+    QTest.keyClick(win.editor.canvas, Qt.Key.Key_S,
+                   Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier)
+    copy = win.folder / "a1_1x1.png"
+    assert p.read_bytes() == before and copy.exists() and "a1_1x1.png" in win.names
+    assert QImage(str(copy)).size().width() == QImage(str(copy)).size().height() == 32

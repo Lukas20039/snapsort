@@ -33,7 +33,12 @@ Filter: `Ctrl+F` / `Ctrl+1…9` cycle off → only → without, or click chips i
 
 Tags live in `<folder>/.snapsort.json` and travel with the folder.
 
-**Edits overwrite the original.** JPEG rotate/flip is lossless (EXIF orientation);
+**Format for Instagram** (edit → *Format*, key `Z`): pick 1:1, 4:5, 1.91:1, 9:16 …, then either
+move/resize the frame and *Ausschnitt übernehmen* (Enter), or *Ganz einpassen* (Shift+Enter) to fit
+the whole photo and fill the bars with white, black, a colour or a blurred copy.
+*Als Kopie speichern* (Ctrl+Shift+S) writes `name_1x1.jpg` next to the original.
+
+**Edits overwrite the original** unless saved as a copy. JPEG rotate/flip is lossless (EXIF orientation);
 other edits re-encode at quality 95 and keep EXIF/ICC/XMP. Undo works until you quit.
 
 ## Tests
