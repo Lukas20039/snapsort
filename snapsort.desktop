@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=snapsort
+GenericName=Image culler
+Comment=Flip through photos and videos, tag favourites, move the keepers
+Exec=snapsort %f
+Icon=image-x-generic
+Terminal=false
+Categories=Graphics;Viewer;
+MimeType=inode/directory;image/jpeg;image/png;image/webp;image/gif;image/heif;image/avif;video/mp4;video/x-matroska;video/quicktime;video/webm;

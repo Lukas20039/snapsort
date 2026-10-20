@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "snapsort"
+version = "0.1.0"
+description = "Fast image/video culling: flip, tag, filter in rounds, move the keepers"
+requires-python = ">=3.12"
+# PySide6 comes from pacman (system Qt with kimageformats); do not declare it here.
+dependencies = []
+
+[project.scripts]
+snapsort = "snapsort.app:main"
+
+[tool.setuptools]
+packages = ["snapsort"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
