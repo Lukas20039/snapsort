@@ -3,7 +3,8 @@ import os
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QFile, QSettings, Qt, QTimer
+from PySide6.QtCore import QFile, QSettings, Qt, QTimer, QUrl
+from PySide6.QtDBus import QDBusInterface, QDBusMessage
 from PySide6.QtGui import QAction, QGuiApplication, QKeySequence
 from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
                                QHBoxLayout,
@@ -658,11 +659,37 @@ class MainWindow(QMainWindow):
         super().closeEvent(e)
 
 
+def resolve_target(arg: str | None) -> Path:
+    """Local path for a CLI argument; remote URLs (webdavs://, smb://, sftp://) are mounted via kio-fuse."""
+    if not arg:
+        return Path.cwd()
+    if "://" not in arg:
+        return Path(arg).expanduser()
+    url = QUrl(arg)
+    if url.isLocalFile():
+        return Path(url.toLocalFile())
+    reply = QDBusInterface("org.kde.KIOFuse", "/org/kde/KIOFuse", "org.kde.KIOFuse.VFS").call("mountUrl", arg)
+    if reply.type() != QDBusMessage.MessageType.ReplyMessage or not reply.arguments():
+        raise OSError(f"kio-fuse could not mount {arg}: {reply.errorMessage() or 'no reply'}")
+    return Path(reply.arguments()[0])
+
+
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("snapsort")
     app.setDesktopFileName("snapsort")
-    w = MainWindow(sys.argv[1] if len(sys.argv) > 1 else None)
+    arg = sys.argv[1] if len(sys.argv) > 1 else None
+    try:
+        target = resolve_target(arg)
+        if not target.exists():
+            raise OSError(f"{target} does not exist")
+    except OSError as e:
+        QMessageBox.critical(None, "snapsort", str(e))
+        d = QFileDialog.getExistingDirectory(None, "Open folder", str(Path.home()))
+        if not d:
+            sys.exit(1)
+        target = Path(d)
+    w = MainWindow(target)
     w.show()
     sys.exit(app.exec())
 

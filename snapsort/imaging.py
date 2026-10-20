@@ -109,7 +109,10 @@ def transform_file(path, op: str) -> bytes:
             r = subprocess.run(["jpegtran", "-perfect", "-copy", "all", *args, "-outfile", tmp, str(path)],
                                capture_output=True, timeout=60)
             if r.returncode == 0 and os.path.getsize(tmp):
-                os.chmod(tmp, path.stat().st_mode & 0o7777)
+                try:
+                    os.chmod(tmp, path.stat().st_mode & 0o7777)
+                except OSError:
+                    pass
                 os.replace(tmp, path)
                 return original
         except (OSError, subprocess.SubprocessError):
@@ -185,6 +188,8 @@ class Loader(QObject):
         self.cache_bytes = 0
         self.cache_limit = 512 << 20
         self.thumbs: OrderedDict[str, QImage] = OrderedDict()
+        self.inflight: set[str] = set()
+        self.wanted: frozenset[str] = frozenset()
         self.thumb_pending: set[str] = set()
         self.thumb_seq = 0
         self.errors: dict[str, str] = {}
@@ -208,14 +213,18 @@ class Loader(QObject):
 
     def prefetch(self, paths: list[str], size: QSize):
         """paths[0] is the current item, the rest are neighbours by priority."""
-        self.decode_pool.clear()
+        self.wanted = frozenset(paths)  # queued jobs for other paths skip themselves
         for i, p in enumerate(paths):
-            if p in self.errors or is_video(p) or self.cached(p, size) is not None:
+            if p in self.inflight or p in self.errors or is_video(p) or self.cached(p, size) is not None:
                 continue
+            self.inflight.add(p)
             g = self.gen.get(p, 0)
             self.decode_pool.start(lambda p=p, g=g: self._decode(p, size, g), 10 - i)
 
     def _decode(self, path, size, gen):
+        if path not in self.wanted:
+            self._decode_failed.emit(path, "", gen)
+            return
         try:
             r = QImageReader(path)
             full = r.size()
@@ -227,6 +236,7 @@ class Loader(QObject):
             self._decode_failed.emit(path, str(e), gen)
 
     def _store(self, path, img, gen):
+        self.inflight.discard(path)
         if gen != self.gen.get(path, 0):
             return
         old = self.cache.pop(path, None)
@@ -240,7 +250,8 @@ class Loader(QObject):
         self.imageReady.emit(path, img)
 
     def _fail(self, path, msg, gen):
-        if gen == self.gen.get(path, 0):
+        self.inflight.discard(path)
+        if msg and gen == self.gen.get(path, 0):
             self.errors[path] = msg
             self.failed.emit(path, msg)
 

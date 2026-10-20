@@ -40,10 +40,13 @@ def atomic_write(path, data: bytes, fsync=True) -> None:
             f.flush()
             if fsync:
                 os.fsync(f.fileno())
-        if path.exists():
-            shutil.copymode(path, tmp)
-        else:
-            os.chmod(tmp, 0o644)
+        try:
+            if path.exists():
+                shutil.copymode(path, tmp)
+            else:
+                os.chmod(tmp, 0o644)
+        except OSError:
+            pass  # e.g. kio-fuse/WebDAV mounts have no permission bits
         os.replace(tmp, path)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)

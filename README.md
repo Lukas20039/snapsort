@@ -8,8 +8,14 @@ move the keepers into a subfolder. Rotate/flip, censor, pen, text, box, arrow.
 ```bash
 sudo pacman -S --needed pyside6 libheif qt6-multimedia-ffmpeg qt6-imageformats kimageformats libjpeg-turbo ffmpeg python-pipx
 pipx install --system-site-packages --python /usr/bin/python3 -e ~/dev/snapsort
-install -Dm644 ~/dev/snapsort/snapsort.desktop ~/.local/share/applications/snapsort.desktop
+# Plasma's PATH has no ~/.local/bin, so the menu entry needs the absolute path
+sed "s|^Exec=snapsort|Exec=$HOME/.local/bin/snapsort|" ~/dev/snapsort/snapsort.desktop > ~/.local/share/applications/snapsort.desktop
+update-desktop-database ~/.local/share/applications && kbuildsycoca6
 ```
+
+Right-click an image in Dolphin → *Open With → snapsort* opens its folder at that image.
+Network folders work too, via kio-fuse: `snapsort webdavs://host/path/` or Open With on a
+WebDAV/SMB/SFTP file in Dolphin.
 
 Run: `snapsort [folder-or-file]`
 

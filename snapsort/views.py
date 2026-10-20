@@ -87,8 +87,9 @@ class SingleView(QStackedWidget):
             self.player.setSource(QUrl.fromLocalFile(path))
             self.player.play()
             return "video"
-        r = QImageReader(path)
-        if r.supportsAnimation() and r.imageCount() > 1:
+        # only probe formats that can animate: opening a file costs a round trip on network mounts
+        r = QImageReader(path) if path.lower().endswith((".gif", ".webp")) else None
+        if r and r.supportsAnimation() and r.imageCount() > 1:
             self.movie = QMovie(path)
             sz = r.size()
             if sz.width() > self.width() or sz.height() > self.height():
