@@ -6,6 +6,7 @@ from pathlib import Path
 from PySide6.QtCore import QFile, QSettings, Qt, QTimer
 from PySide6.QtGui import QAction, QGuiApplication, QKeySequence
 from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
+                               QHBoxLayout,
                                QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox, QSpinBox, QStackedWidget,
                                QToolBar, QToolButton, QWidget)
 
@@ -36,6 +37,9 @@ class MainWindow(QMainWindow):
         self.mode = G
         self.undo: list[tuple[str, callable]] = []
         self.editor: EditView | None = None
+        self.edit_path: str | None = None
+        self.lossy_ok = False
+        self.fb_tags: tuple | None = None
 
         self.single = SingleView()
         self.model = GridModel(self)
@@ -54,6 +58,10 @@ class MainWindow(QMainWindow):
 
         self.filterbar = QToolBar("Filter")
         self.filterbar.setMovable(False)
+        box = QWidget()
+        self.fb_layout = QHBoxLayout(box)
+        self.fb_layout.setContentsMargins(4, 0, 4, 0)
+        self.filterbar.addWidget(box)
         # rebuilt on the next loop turn: chips must not be deleted inside their own click signal
         self.fb_timer = QTimer(self, singleShot=True, interval=0, timeout=self._build_filterbar)
         self.addToolBar(self.filterbar)
@@ -119,6 +127,7 @@ class MainWindow(QMainWindow):
     def _sync_actions(self):
         for a, modes in self.actions_by_mode:
             a.setEnabled(self.mode in modes)
+        self.filterbar.setEnabled(self.mode in BROWSE)
 
     # ---------- folder / view ----------
     def open_target(self, target: Path):
@@ -142,6 +151,8 @@ class MainWindow(QMainWindow):
 
     def rescan(self):
         cur = self.current()
+        self.loader.errors.clear()
+        self.loader.thumb_errors.clear()
         self.names = st.list_media(self.folder)
         self.rebuild_view(cur)
         self.show_current()
@@ -165,7 +176,9 @@ class MainWindow(QMainWindow):
             self.index = later[0] if later else max(0, len(self.view) - 1) if keep else 0
         self.model.reset()
         self._select_grid()
-        self.refresh_filterbar()
+        self.refresh_filterbar(force=True)
+        if not self.view and self.mode == S:
+            self.set_mode(G)
         self.update_status()
 
     def _select_grid(self):
@@ -236,6 +249,8 @@ class MainWindow(QMainWindow):
         if self.mode != S or name is None or path != self.path(name) or self.single.currentWidget() is not self.single.canvas:
             return
         if isinstance(img_or_msg, str):
+            if not img_or_msg:
+                return  # thumbnail failure
             self.single.canvas.show_image(None, f"Cannot open {name}\n{img_or_msg}")
         else:
             self.single.canvas.show_image(img_or_msg)
@@ -250,6 +265,8 @@ class MainWindow(QMainWindow):
     def _changed(self, name):
         if name in self.view:
             self.model.refresh(self.view.index(name))
+        if self.store.warning:
+            self.flash(self.store.warning, 0)
         self.refresh_filterbar()
         self.update_status()
 
@@ -306,13 +323,21 @@ class MainWindow(QMainWindow):
         self.rebuild_view()
         self.show_current()
 
-    def refresh_filterbar(self):
+    def refresh_filterbar(self, force=False):
+        if force:
+            self.fb_tags = None
         self.fb_timer.start()
 
     def _build_filterbar(self):
-        bar = self.filterbar
-        bar.clear()
         f = self.filter
+        key = (frozenset(self.store.all_tags()), tuple(self.slots), len(self.view), self.store.round)
+        if key == self.fb_tags:
+            return
+        self.fb_tags = key
+        bar = self.fb_layout
+        while item := bar.takeAt(0):
+            if item.widget():
+                item.widget().deleteLater()
         tags = ["fav", "keep", "reject"] + self.slots
         tags += sorted(self.store.all_tags() | f.include | f.exclude)
         for t in dict.fromkeys(tags):
@@ -325,7 +350,7 @@ class MainWindow(QMainWindow):
             b.setToolTip("click: off → only → without")
             b.clicked.connect(lambda _=False, t=t: self.cycle_filter(t))
             bar.addWidget(b)
-        bar.addSeparator()
+        bar.addSpacing(12)
         anyall = QToolButton(text="match ALL" if f.mode_all else "match ANY")
         anyall.clicked.connect(self.toggle_all)
         bar.addWidget(anyall)
@@ -389,6 +414,9 @@ class MainWindow(QMainWindow):
             self.flash("Invalid folder name")
             return
         dst = self.folder / name
+        if dst.exists() and not dst.is_dir():
+            self.flash(f"{name} exists and is not a folder")
+            return
         res = st.execute_move(self.store, st.plan_move(self.view, dst), dst)
         moved = {old for old, _ in res.moved}
         self.names = [n for n in self.names if n not in moved]
@@ -399,7 +427,8 @@ class MainWindow(QMainWindow):
             failed = st.undo_move(self.store, res)
             self.names = st.list_media(self.folder)
             if failed:
-                self.flash(f"Could not restore: {', '.join(failed)}", 8000)
+                self.undo.clear()  # older entries may point at names that are now taken
+                raise OSError(f"could not restore {', '.join(failed)} (name taken); undo history cleared")
         self.push_undo(f"move {len(res.moved)} files", undo)
         self.filter = Filter()
         self.rebuild_view()
@@ -422,6 +451,8 @@ class MainWindow(QMainWindow):
         self.loader.invalidate(self.path(name))
 
         def undo():
+            if os.path.exists(self.path(name)):
+                raise FileExistsError(f"{name} exists again")
             os.rename(trashed, self.path(name))
             (trashed.parent.parent / "info" / f"{trashed.name}.trashinfo").unlink(missing_ok=True)
             if entry:
@@ -446,14 +477,21 @@ class MainWindow(QMainWindow):
         try:
             fn()
         except OSError as e:
-            self.flash(f"Undo failed: {e}", 8000)
+            self.flash(f"Undo failed: {e}", 0)
+            self.rebuild_view()
             return
         self.rebuild_view()
         self.show_current()
         self.flash(f"Undid: {label}")
 
     def _restore_bytes(self, p, data):
+        stamp = os.stat(p)
+        sig = (stamp.st_size, stamp.st_mtime_ns)
+
         def undo():
+            now = os.stat(p)
+            if (now.st_size, now.st_mtime_ns) != sig:
+                raise OSError(f"{Path(p).name} changed since, not restored")
             st.atomic_write(p, data)
             self.loader.invalidate(p)
         return undo
@@ -464,6 +502,14 @@ class MainWindow(QMainWindow):
         if not name:
             return
         p = self.path(name)
+        ext = Path(name).suffix.lower()
+        if ext not in (".jpg", ".jpeg", ".png") and not self.lossy_ok:
+            if QMessageBox.question(
+                    self, "Rotate", f"Rotating {ext} re-encodes the file: slight quality loss and its "
+                    "metadata (capture date, GPS) is removed. Continue for this session?") \
+                    != QMessageBox.StandardButton.Yes:
+                return
+            self.lossy_ok = True
         QGuiApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             original = imaging.transform_file(p, op)
@@ -493,6 +539,7 @@ class MainWindow(QMainWindow):
             return
         finally:
             QGuiApplication.restoreOverrideCursor()
+        self.edit_path = p
         self.editor = EditView(img)
         self.editor.save_requested.connect(self.save_edit)
         self.editor.close_requested.connect(self.close_edit)
@@ -504,7 +551,7 @@ class MainWindow(QMainWindow):
         self.update_status()
 
     def save_edit(self):
-        p = self.path(self.current())
+        p = self.edit_path
         QGuiApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             original = imaging.save_edited(p, self.editor.image)
@@ -513,10 +560,10 @@ class MainWindow(QMainWindow):
             return
         finally:
             QGuiApplication.restoreOverrideCursor()
-        self.push_undo(f"edit {self.current()}", self._restore_bytes(p, original))
+        self.push_undo(f"edit {Path(p).name}", self._restore_bytes(p, original))
         self.loader.invalidate(p)
         self._leave_edit()
-        self.flash(f"Saved {self.current()}")
+        self.flash(f"Saved {Path(p).name}")
 
     def close_edit(self):
         if self.editor.dirty and QMessageBox.question(self, "Discard edits?", "Discard unsaved edits?") \
@@ -528,8 +575,9 @@ class MainWindow(QMainWindow):
         self.stack.removeWidget(self.editor)
         self.editor.deleteLater()
         self.editor = None
+        self.edit_path = None
         self.set_mode(S)
-        self._changed(self.current())
+        self.update_status()
 
     # ---------- misc ----------
     def edit_slots(self):
@@ -605,6 +653,8 @@ class MainWindow(QMainWindow):
             return
         self.loader.decode_pool.clear()
         self.loader.thumb_pool.clear()
+        self.loader.decode_pool.waitForDone(2000)
+        self.loader.thumb_pool.waitForDone(2000)
         super().closeEvent(e)
 
 

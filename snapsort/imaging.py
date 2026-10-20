@@ -88,6 +88,10 @@ def transform_file(path, op: str) -> bytes:
     path = Path(path)
     original = path.read_bytes()
     if path.suffix.lower() in JPEG_EXT:
+        inserted = exif.insert_orientation(original, exif.compose(1, op))
+        if inserted:
+            atomic_write(path, inserted)
+            return original
         p = exif.orientation_patch(original)
         if p:
             value, off, bo = p
@@ -136,8 +140,8 @@ def make_thumb(path) -> QImage:
         img = QImage(str(key))
         if not img.isNull():
             return img
-    CACHE.mkdir(parents=True, exist_ok=True)
     if is_video(path):
+        CACHE.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(suffix=".jpg", dir=CACHE)
         os.close(fd)
         try:
@@ -153,7 +157,11 @@ def make_thumb(path) -> QImage:
             Path(tmp).unlink(missing_ok=True)
         raise OSError("no video frame")
     img = decode_scaled(path, QSize(THUMB, THUMB))
-    atomic_write(key, encode(img, "jpg", 85))
+    try:
+        CACHE.mkdir(parents=True, exist_ok=True)
+        atomic_write(key, encode(img, "jpg", 85), fsync=False)
+    except OSError:
+        pass  # cache is best effort
     return img
 
 
@@ -161,6 +169,11 @@ class Loader(QObject):
     imageReady = Signal(str, QImage)
     thumbReady = Signal(str, QImage)
     failed = Signal(str, str)
+    # workers emit these with the generation they started at; stale results are dropped
+    _decoded = Signal(str, QImage, int)
+    _thumbed = Signal(str, QImage, int)
+    _decode_failed = Signal(str, str, int)
+    _thumb_failed = Signal(str, int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -172,12 +185,15 @@ class Loader(QObject):
         self.cache_bytes = 0
         self.cache_limit = 512 << 20
         self.thumbs: OrderedDict[str, QImage] = OrderedDict()
-        self.pending: set[str] = set()
         self.thumb_pending: set[str] = set()
+        self.thumb_seq = 0
         self.errors: dict[str, str] = {}
-        self.imageReady.connect(self._store)
-        self.thumbReady.connect(self._store_thumb)
-        self.failed.connect(self._fail)
+        self.thumb_errors: set[str] = set()
+        self.gen: dict[str, int] = {}
+        self._decoded.connect(self._store)
+        self._thumbed.connect(self._store_thumb)
+        self._decode_failed.connect(self._fail)
+        self._thumb_failed.connect(self._fail_thumb)
 
     # --- view images ---
     def cached(self, path, size: QSize) -> QImage | None:
@@ -193,26 +209,26 @@ class Loader(QObject):
     def prefetch(self, paths: list[str], size: QSize):
         """paths[0] is the current item, the rest are neighbours by priority."""
         self.decode_pool.clear()
-        self.pending.clear()
         for i, p in enumerate(paths):
             if p in self.errors or is_video(p) or self.cached(p, size) is not None:
                 continue
-            self.pending.add(p)
-            self.decode_pool.start(lambda p=p: self._decode(p, size), 10 - i)
+            g = self.gen.get(p, 0)
+            self.decode_pool.start(lambda p=p, g=g: self._decode(p, size, g), 10 - i)
 
-    def _decode(self, path, size):
+    def _decode(self, path, size, gen):
         try:
             r = QImageReader(path)
             full = r.size()
             img = decode_scaled(path, size)
             if img.size() == full or img.size() == full.transposed():
                 img.setText("full", "1")
-            self.imageReady.emit(path, img)
+            self._decoded.emit(path, img, gen)
         except Exception as e:  # noqa: BLE001 - reported to UI
-            self.failed.emit(path, str(e))
+            self._decode_failed.emit(path, str(e), gen)
 
-    def _store(self, path, img):
-        self.pending.discard(path)
+    def _store(self, path, img, gen):
+        if gen != self.gen.get(path, 0):
+            return
         old = self.cache.pop(path, None)
         if old is not None:
             self.cache_bytes -= old.sizeInBytes()
@@ -221,11 +237,18 @@ class Loader(QObject):
         while self.cache_bytes > self.cache_limit and len(self.cache) > 1:
             _, ev = self.cache.popitem(last=False)
             self.cache_bytes -= ev.sizeInBytes()
+        self.imageReady.emit(path, img)
 
-    def _fail(self, path, msg):
-        self.pending.discard(path)
-        self.thumb_pending.discard(path)
-        self.errors[path] = msg
+    def _fail(self, path, msg, gen):
+        if gen == self.gen.get(path, 0):
+            self.errors[path] = msg
+            self.failed.emit(path, msg)
+
+    def _fail_thumb(self, path, gen):
+        if gen == self.gen.get(path, 0):
+            self.thumb_pending.discard(path)
+            self.thumb_errors.add(path)
+            self.failed.emit(path, "")
 
     # --- thumbnails ---
     def thumb(self, path) -> QImage | None:
@@ -233,24 +256,32 @@ class Loader(QObject):
         if img is not None:
             self.thumbs.move_to_end(path)
             return img
-        if path not in self.thumb_pending and path not in self.errors:
+        if path not in self.thumb_pending and path not in self.thumb_errors:
             self.thumb_pending.add(path)
-            self.thumb_pool.start(lambda: self._thumb(path))
+            self.thumb_seq += 1  # newest request first: the cells on screen now
+            g = self.gen.get(path, 0)
+            self.thumb_pool.start(lambda: self._thumb(path, g), self.thumb_seq)
         return None
 
-    def _thumb(self, path):
+    def _thumb(self, path, gen):
         try:
-            self.thumbReady.emit(path, make_thumb(path))
-        except Exception as e:  # noqa: BLE001
-            self.failed.emit(path, str(e))
+            self._thumbed.emit(path, make_thumb(path), gen)
+        except Exception:  # noqa: BLE001
+            self._thumb_failed.emit(path, gen)
 
-    def _store_thumb(self, path, img):
+    def _store_thumb(self, path, img, gen):
+        if gen != self.gen.get(path, 0):
+            return
         self.thumb_pending.discard(path)
         self.thumbs[path] = img
         while len(self.thumbs) > 1500:
             self.thumbs.popitem(last=False)
+        self.thumbReady.emit(path, img)
 
     def invalidate(self, path):
+        self.gen[path] = self.gen.get(path, 0) + 1
+        self.thumb_pending.discard(path)
+        self.thumb_errors.discard(path)
         old = self.cache.pop(path, None)
         if old is not None:
             self.cache_bytes -= old.sizeInBytes()

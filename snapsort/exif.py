@@ -176,3 +176,15 @@ def splice_metadata(new_jpeg: bytes, original: bytes) -> bytes:
     rest_start = new_segs[-1][2]
     rest = [new_jpeg[s:e] for m, s, e in new_segs if m not in (0xE0, 0xE1, 0xE2, 0xED)]
     return b"".join([b"\xFF\xD8", *app0, *keep, *rest, new_jpeg[rest_start:]])
+
+
+def insert_orientation(data: bytes, orientation: int) -> bytes | None:
+    """JPEG without an Exif segment -> same JPEG with a minimal Exif carrying Orientation."""
+    segs = segments(data)
+    if not segs or _exif_segment(data):
+        return None
+    tiff = b"MM\0*\0\0\0\x08" + struct.pack(">HHHIHH", 1, 0x0112, 3, 1, orientation, 0) + b"\0\0\0\0"
+    payload = EXIF_HDR + tiff
+    app1 = b"\xFF\xE1" + struct.pack(">H", len(payload) + 2) + payload
+    at = segs[0][2] if segs[0][0] == 0xE0 else 2  # keep JFIF APP0 first
+    return data[:at] + app1 + data[at:]

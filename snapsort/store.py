@@ -31,14 +31,15 @@ def list_media(folder) -> list[str]:
     return sorted(names, key=natural_key)
 
 
-def atomic_write(path, data: bytes) -> None:
+def atomic_write(path, data: bytes, fsync=True) -> None:
     path = Path(path)
     fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(data)
             f.flush()
-            os.fsync(f.fileno())
+            if fsync:
+                os.fsync(f.fileno())
         if path.exists():
             shutil.copymode(path, tmp)
         else:
@@ -59,15 +60,23 @@ class TagStore:
         try:
             raw = json.loads(self.path.read_text())
             self.round = int(raw.get("round", 0))
-            self.files = {k: {"tags": list(v.get("tags", [])), "round": int(v.get("round", 0))}
-                          for k, v in raw.get("files", {}).items()}
+            self.files = {}
+            for k, v in raw.get("files", {}).items():
+                if not isinstance(v.get("tags", []), list):
+                    raise TypeError("tags must be a list")
+                self.files[k] = {"tags": [str(t) for t in v.get("tags", [])], "round": int(v.get("round", 0))}
         except FileNotFoundError:
             pass
+        except OSError as e:
+            self.warning = f"Cannot read {STORE_NAME}: {e.strerror}"
         except (ValueError, AttributeError, TypeError):
-            bad = self.path.with_name(f"{STORE_NAME}.bad-{int(time.time())}")
-            os.replace(self.path, bad)
             self.round, self.files = 0, {}
-            self.warning = f"Corrupt {STORE_NAME} moved to {bad.name}"
+            bad = self.path.with_name(f"{STORE_NAME}.bad-{int(time.time())}")
+            try:
+                os.replace(self.path, bad)
+                self.warning = f"Corrupt {STORE_NAME} moved to {bad.name}"
+            except OSError as e:
+                self.warning = f"Corrupt {STORE_NAME}, cannot move it aside: {e.strerror}"
 
     def tags(self, name) -> set[str]:
         return set(self.files.get(name, {}).get("tags", ()))
@@ -94,14 +103,21 @@ class TagStore:
             tags.append(tag)
         self.save()
 
-    def save(self) -> None:
+    def save(self) -> bool:
+        """Write to disk; on failure keep the data in memory and set self.warning."""
         # ponytail: sync save per mutation, debounce with a QTimer if folders reach ~50k files
         files = {k: {"tags": sorted(v["tags"]), **({"round": v["round"]} if v["round"] else {})}
                  for k, v in self.files.items() if v["tags"] or v["round"]}
         if not files and not self.round and not self.path.exists():
-            return
+            return True
         data = {"version": 1, "round": self.round, "files": files}
-        atomic_write(self.path, json.dumps(data, indent=1, sort_keys=True).encode())
+        try:
+            atomic_write(self.path, json.dumps(data, indent=1, sort_keys=True).encode(), fsync=False)
+        except OSError as e:
+            self.warning = f"Tags NOT saved ({self.folder}): {e.strerror}"
+            return False
+        self.warning = None
+        return True
 
 
 @dataclass
@@ -140,7 +156,8 @@ def round_counts(store, names):
 
 def next_round(store, names, undecided_keep: bool) -> dict:
     """Survivors (kept, plus undecided if undecided_keep) advance; returns an undo snapshot."""
-    snap = {"round": store.round, "files": copy.deepcopy(store.files)}
+    snap = {"round": store.round,
+            "files": {n: copy.deepcopy(store.files[n]) if n in store.files else None for n in names}}
     new = store.round + 1
     for n in names:
         tags = store.tags(n)
@@ -154,8 +171,15 @@ def next_round(store, names, undecided_keep: bool) -> dict:
 
 
 def restore_snapshot(store, snap) -> None:
+    """Undo next_round: restore round and verdicts of the round's files, keep later tags."""
     store.round = snap["round"]
-    store.files = copy.deepcopy(snap["files"])
+    for n, old in snap["files"].items():
+        cur = store.files.get(n)
+        if cur is None and old is None:
+            continue
+        tags = [t for t in (cur or {"tags": []})["tags"] if t not in VERDICTS]
+        tags += [t for t in (old or {"tags": []})["tags"] if t in VERDICTS]
+        store.files[n] = {"tags": tags, "round": (old or {"round": 0})["round"]}
     store.save()
 
 

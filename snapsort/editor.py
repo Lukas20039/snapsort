@@ -3,7 +3,7 @@ import math
 
 from PySide6.QtCore import QLineF, QPointF, QRect, QRectF, Qt, Signal
 from PySide6.QtGui import (QAction, QActionGroup, QColor, QFont, QImage, QKeySequence, QPainter, QPainterPath,
-                           QPen, QTransform)
+                           QPen, QPixmap, QTransform)
 from PySide6.QtWidgets import QColorDialog, QInputDialog, QSpinBox, QToolBar, QVBoxLayout, QWidget
 
 TOOLS = [("pen", "P", "Pen"), ("box", "B", "Box"), ("arrow", "A", "Arrow"), ("text", "T", "Text"),
@@ -46,6 +46,7 @@ class _Canvas(QWidget):
         self.start: QPointF | None = None
         self.cur: QPointF | None = None
         self.path: QPainterPath | None = None
+        self.view: QPixmap | None = None
         self.setMouseTracking(False)
         self.setCursor(Qt.CursorShape.CrossCursor)
 
@@ -54,6 +55,16 @@ class _Canvas(QWidget):
         s = min(self.width() / img.width(), self.height() / img.height(), 1.0)
         self.xf = QTransform.fromTranslate((self.width() - img.width() * s) / 2,
                                            (self.height() - img.height() * s) / 2).scale(s, s)
+        self.refresh()
+
+    def refresh(self):
+        """Re-render the display-sized copy after the image changed."""
+        r = self.xf.mapRect(QRectF(self.ed.image.rect())).toAlignedRect()
+        self.view = QPixmap.fromImage(self.ed.image.scaled(
+            r.size() * self.devicePixelRatioF(), Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation))
+        self.view.setDevicePixelRatio(self.devicePixelRatioF())
+        self.update()
 
     def _img_pos(self, e) -> QPointF:
         return self.xf.inverted()[0].map(e.position())
@@ -86,9 +97,9 @@ class _Canvas(QWidget):
     def paintEvent(self, e):
         p = QPainter(self)
         p.fillRect(self.rect(), QColor(16, 16, 16))
+        if self.view:
+            p.drawPixmap(self.xf.map(QPointF(0, 0)), self.view)
         p.setTransform(self.xf)
-        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        p.drawImage(0, 0, self.ed.image)
         if self.start is None:
             return
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -194,7 +205,7 @@ class EditView(QWidget):
             p.setPen(self.pen())
             p.drawPath(shape) if shape else p.drawRect(rect)
         p.end()
-        self.canvas.update()
+        self.canvas.refresh()
 
     def add_text(self, pos: QPointF):
         text, ok = QInputDialog.getText(self, "Text", "Text:")
@@ -214,7 +225,7 @@ class EditView(QWidget):
         p.setPen(self.color)
         p.drawText(pos, text)
         p.end()
-        self.canvas.update()
+        self.canvas.refresh()
 
     def undo_step(self):
         if not self.undo:
@@ -224,4 +235,4 @@ class EditView(QWidget):
         p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
         p.drawImage(r.topLeft(), patch)
         p.end()
-        self.canvas.update()
+        self.canvas.refresh()

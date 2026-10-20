@@ -115,3 +115,26 @@ def test_undo_removes_created_folder_and_reports_conflicts(tmp_path):
     res2 = st.execute_move(s, st.plan_move(["a.jpg"], tmp_path / "n2"), tmp_path / "n2")
     st.undo_move(s, res2)
     assert not (tmp_path / "n2").exists()
+
+
+def test_undo_round_keeps_later_tags(tmp_path):
+    s = TagStore(tmp_path)
+    s.set_verdict("a", "keep")
+    snap = st.next_round(s, ["a", "b"], undecided_keep=False)
+    s.toggle("a", "car")          # tagged after the round
+    s.set_verdict("a", "reject")  # verdict in the new round
+    st.restore_snapshot(s, snap)
+    assert s.tags("a") == {"car", "keep"} and s.survived("a") == 0 and s.round == 0
+
+
+def test_save_failure_keeps_memory_and_warns(tmp_path, monkeypatch):
+    s = TagStore(tmp_path)
+    monkeypatch.setattr(st, "atomic_write", lambda *a, **k: (_ for _ in ()).throw(PermissionError(13, "denied")))
+    s.toggle("a", "fav")
+    assert s.tags("a") == {"fav"} and "NOT saved" in s.warning
+
+
+def test_non_list_tags_is_corrupt(tmp_path):
+    (tmp_path / ".snapsort.json").write_text('{"files": {"a": {"tags": "fav"}}}')
+    s = TagStore(tmp_path)
+    assert s.files == {} and "Corrupt" in s.warning
